@@ -17,11 +17,32 @@
 Only really intended to be used by internal build scripts.
 """
 
+from __future__ import annotations
+
+import logging
 import sys
+
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(levelname)-8s %(message)s")
+
 sys.path[0:0] = [""]
 
-import bson
-import pymongo
+import bson  # noqa: E402
+import pymongo  # noqa: E402
 
-if not pymongo.has_c() or not bson.has_c():
-    sys.exit("could not load C extensions")
+
+def main() -> None:
+    if not pymongo.has_c() or not bson.has_c():
+        try:
+            from pymongo import _cmessage  # type:ignore[attr-defined] # noqa: F401
+        except Exception as e:
+            LOGGER.exception(e)
+        try:
+            from bson import _cbson  # type:ignore[attr-defined] # noqa: F401
+        except Exception as e:
+            LOGGER.exception(e)
+        sys.exit("could not load C extensions")
+
+
+if __name__ == "__main__":
+    main()

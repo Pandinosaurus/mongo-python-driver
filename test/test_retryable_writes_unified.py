@@ -14,20 +14,23 @@
 
 """Test the Retryable Writes unified spec tests."""
 
+from __future__ import annotations
+
 import os
 import sys
+from pathlib import Path
 
 sys.path[0:0] = [""]
 
 from test import unittest
-from test.unified_format import generate_test_classes
+from test.unified_format import generate_test_classes, get_test_path
 
-# Location of JSON test specifications.
-TEST_PATH = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), 'retryable_writes', 'unified')
+_IS_SYNC = True
 
 # Generate unified tests.
-globals().update(generate_test_classes(TEST_PATH, module=__name__))
+globals().update(
+    generate_test_classes(get_test_path("retryable_writes", "unified"), module=__name__)
+)
 
 if __name__ == "__main__":
     unittest.main()

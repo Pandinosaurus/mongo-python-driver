@@ -14,10 +14,13 @@
 
 """Tests for the Timestamp class."""
 
-import datetime
-import sys
+from __future__ import annotations
+
 import copy
+import datetime
 import pickle
+import sys
+
 sys.path[0:0] = [""]
 
 from bson.timestamp import Timestamp
@@ -30,7 +33,7 @@ class TestTimestamp(unittest.TestCase):
         t = Timestamp(123, 456)
         self.assertEqual(t.time, 123)
         self.assertEqual(t.inc, 456)
-        self.assertTrue(isinstance(t, Timestamp))
+        self.assertIsInstance(t, Timestamp)
 
     def test_datetime(self):
         d = datetime.datetime(2010, 5, 5, tzinfo=utc)
@@ -77,6 +80,7 @@ class TestTimestamp(unittest.TestCase):
     def test_repr(self):
         t = Timestamp(0, 0)
         self.assertEqual(repr(t), "Timestamp(0, 0)")
+
 
 if __name__ == "__main__":
     unittest.main()

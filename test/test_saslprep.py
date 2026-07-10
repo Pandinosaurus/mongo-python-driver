@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import sys
 
@@ -19,8 +20,8 @@ sys.path[0:0] = [""]
 from pymongo.saslprep import saslprep
 from test import unittest
 
-class TestSASLprep(unittest.TestCase):
 
+class TestSASLprep(unittest.TestCase):
     def test_saslprep(self):
         try:
             import stringprep
@@ -30,10 +31,10 @@ class TestSASLprep(unittest.TestCase):
             self.assertEqual(saslprep(b"user"), b"user")
         else:
             # Examples from RFC4013, Section 3.
-            self.assertEqual(saslprep("I\u00ADX"), "IX")
+            self.assertEqual(saslprep("I\u00adX"), "IX")
             self.assertEqual(saslprep("user"), "user")
             self.assertEqual(saslprep("USER"), "USER")
-            self.assertEqual(saslprep("\u00AA"), "a")
+            self.assertEqual(saslprep("\u00aa"), "a")
             self.assertEqual(saslprep("\u2168"), "IX")
             self.assertRaises(ValueError, saslprep, "\u0007")
             self.assertRaises(ValueError, saslprep, "\u0627\u0031")

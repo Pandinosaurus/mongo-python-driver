@@ -20,7 +20,7 @@
               "$oid": "000000000000000000000001"
             },
             "minWireVersion": 0,
-            "maxWireVersion": 6
+            "maxWireVersion": 17
           }
         ]
       ],
@@ -64,27 +64,31 @@
             "setName": "rs",
             "setVersion": 2,
             "minWireVersion": 0,
-            "maxWireVersion": 6
+            "maxWireVersion": 17
           }
         ]
       ],
       "outcome": {
         "servers": {
           "a:27017": {
-            "type": "Unknown",
-            "setName": null,
-            "electionId": null
-          },
-          "b:27017": {
             "type": "RSPrimary",
             "setName": "rs",
-            "setVersion": 2
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000001"
+            }
+          },
+          "b:27017": {
+            "type": "Unknown",
+            "setName": null,
+            "electionId": null,
+            "error": "primary marked stale due to electionId/setVersion mismatch"
           }
         },
         "topologyType": "ReplicaSetWithPrimary",
         "logicalSessionTimeoutMinutes": null,
         "setName": "rs",
-        "maxSetVersion": 2,
+        "maxSetVersion": 1,
         "maxElectionId": {
           "$oid": "000000000000000000000001"
         }
@@ -108,29 +112,33 @@
               "$oid": "000000000000000000000002"
             },
             "minWireVersion": 0,
-            "maxWireVersion": 6
+            "maxWireVersion": 17
           }
         ]
       ],
       "outcome": {
         "servers": {
           "a:27017": {
-            "type": "Unknown",
-            "setName": null,
-            "electionId": null
-          },
-          "b:27017": {
             "type": "RSPrimary",
             "setName": "rs",
-            "setVersion": 2
+            "setVersion": 1,
+            "electionId": {
+              "$oid": "000000000000000000000002"
+            }
+          },
+          "b:27017": {
+            "type": "Unknown",
+            "setName": null,
+            "electionId": null,
+            "error": "primary marked stale due to electionId/setVersion mismatch"
           }
         },
         "topologyType": "ReplicaSetWithPrimary",
         "logicalSessionTimeoutMinutes": null,
         "setName": "rs",
-        "maxSetVersion": 2,
+        "maxSetVersion": 1,
         "maxElectionId": {
-          "$oid": "000000000000000000000001"
+          "$oid": "000000000000000000000002"
         }
       }
     }

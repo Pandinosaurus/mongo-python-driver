@@ -14,70 +14,84 @@
 
 """Test $clusterTime handling."""
 
-from bson import Timestamp
-from mockupdb import going, MockupDB
-from pymongo import (MongoClient,
-                     InsertOne,
-                     UpdateOne,
-                     DeleteMany)
+from __future__ import annotations
 
 import unittest
 
+import pytest
 
-class TestClusterTime(unittest.TestCase):
-    def cluster_time_conversation(self, callback, replies):
+from test import PyMongoTestCase
+
+try:
+    from mockupdb import MockupDB, going
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
+
+from bson import Timestamp
+from pymongo import DeleteMany, InsertOne, MongoClient, UpdateOne
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
+from pymongo.errors import OperationFailure
+
+pytestmark = pytest.mark.mockupdb
+
+
+class TestClusterTime(PyMongoTestCase):
+    def cluster_time_conversation(
+        self, callback, replies, max_wire_version=MIN_SUPPORTED_WIRE_VERSION
+    ):
         cluster_time = Timestamp(0, 0)
         server = MockupDB()
 
-        # First test all commands include $clusterTime with wire version 6.
-        responder = server.autoresponds(
-            'ismaster',
-            {'minWireVersion': 0,
-             'maxWireVersion': 6,
-             '$clusterTime': {'clusterTime': cluster_time}})
+        # First test all commands include $clusterTime with max_wire_version.
+        _ = server.autoresponds(
+            "ismaster",
+            {
+                "minWireVersion": 0,
+                "maxWireVersion": max_wire_version,
+                "$clusterTime": {"clusterTime": cluster_time},
+            },
+        )
 
         server.run()
         self.addCleanup(server.stop)
 
-        client = MongoClient(server.uri)
-        self.addCleanup(client.close)
+        client = self.simple_client(server.uri)
 
         with going(callback, client):
             for reply in replies:
                 request = server.receives()
-                self.assertIn('$clusterTime', request)
-                self.assertEqual(request['$clusterTime']['clusterTime'],
-                                 cluster_time)
-                cluster_time = Timestamp(cluster_time.time,
-                                         cluster_time.inc + 1)
-                reply['$clusterTime'] = {'clusterTime': cluster_time}
+                self.assertIn("$clusterTime", request)
+                self.assertEqual(request["$clusterTime"]["clusterTime"], cluster_time)
+                cluster_time = Timestamp(cluster_time.time, cluster_time.inc + 1)
+                reply["$clusterTime"] = {"clusterTime": cluster_time}
                 request.reply(reply)
 
     def test_command(self):
         def callback(client):
-            client.db.command('ping')
-            client.db.command('ping')
+            client.db.command("ping")
+            client.db.command("ping")
 
-        self.cluster_time_conversation(callback, [{'ok': 1}] * 2)
+        self.cluster_time_conversation(callback, [{"ok": 1}] * 2)
 
     def test_bulk(self):
-        def callback(client):
-            client.db.collection.bulk_write([
-                InsertOne({}),
-                InsertOne({}),
-                UpdateOne({}, {'$inc': {'x': 1}}),
-                DeleteMany({})])
+        def callback(client: MongoClient[dict]) -> None:
+            client.db.collection.bulk_write(
+                [InsertOne({}), InsertOne({}), UpdateOne({}, {"$inc": {"x": 1}}), DeleteMany({})]
+            )
 
         self.cluster_time_conversation(
             callback,
-            [{'ok': 1, 'nInserted': 2},
-             {'ok': 1, 'nModified': 1},
-             {'ok': 1, 'nDeleted': 2}])
+            [{"ok": 1, "nInserted": 2}, {"ok": 1, "nModified": 1}, {"ok": 1, "nDeleted": 2}],
+        )
 
     batches = [
-        {'cursor': {'id': 123, 'firstBatch': [{'a': 1}]}},
-        {'cursor': {'id': 123, 'nextBatch': [{'a': 2}]}},
-        {'cursor': {'id': 0, 'nextBatch': [{'a': 3}]}}]
+        {"cursor": {"id": 123, "firstBatch": [{"a": 1}]}},
+        {"cursor": {"id": 123, "nextBatch": [{"a": 2}]}},
+        {"cursor": {"id": 0, "nextBatch": [{"a": 3}]}},
+    ]
 
     def test_cursor(self):
         def callback(client):
@@ -95,70 +109,53 @@ class TestClusterTime(unittest.TestCase):
         def callback(client):
             client.db.collection.find().explain()
 
-        self.cluster_time_conversation(callback, [{'ok': 1}])
+        self.cluster_time_conversation(callback, [{"ok": 1}])
 
     def test_monitor(self):
         cluster_time = Timestamp(0, 0)
-        reply = {'minWireVersion': 0,
-                 'maxWireVersion': 6,
-                 '$clusterTime': {'clusterTime': cluster_time}}
+        reply = {
+            "minWireVersion": 0,
+            "maxWireVersion": MIN_SUPPORTED_WIRE_VERSION,
+            "$clusterTime": {"clusterTime": cluster_time},
+        }
 
         server = MockupDB()
         server.run()
         self.addCleanup(server.stop)
 
-        client = MongoClient(server.uri, heartbeatFrequencyMS=500)
-        self.addCleanup(client.close)
+        client = self.simple_client(server.uri, heartbeatFrequencyMS=500)
 
-        request = server.receives('ismaster')
-        # No $clusterTime in first ismaster, only in subsequent ones
-        self.assertNotIn('$clusterTime', request)
-        request.ok(reply)
-
-        # Next exchange: client returns first clusterTime, we send the second.
-        request = server.receives('ismaster')
-        self.assertIn('$clusterTime', request)
-        self.assertEqual(request['$clusterTime']['clusterTime'],
-                         cluster_time)
-        cluster_time = Timestamp(cluster_time.time,
-                                 cluster_time.inc + 1)
-        reply['$clusterTime'] = {'clusterTime': cluster_time}
-        request.reply(reply)
-
-        # Third exchange: client returns second clusterTime.
-        request = server.receives('ismaster')
-        self.assertEqual(request['$clusterTime']['clusterTime'],
-                         cluster_time)
-
-        # Return command error with a new clusterTime.
-        cluster_time = Timestamp(cluster_time.time,
-                                 cluster_time.inc + 1)
-        error = {'ok': 0,
-                 'code': 211,
-                 'errmsg': 'Cache Reader No keys found for HMAC ...',
-                 '$clusterTime': {'clusterTime': cluster_time}}
-        request.reply(error)
-
-        # PyMongo 3.11+ closes the monitoring connection on command errors.
-
-        # Fourth exchange: the Monitor closes the connection and runs the
-        # handshake on a new connection.
-        request = server.receives('ismaster')
-        # No $clusterTime in first ismaster, only in subsequent ones
-        self.assertNotIn('$clusterTime', request)
-
-        # Reply without $clusterTime.
-        reply.pop('$clusterTime')
-        request.reply(reply)
-
-        # Fifth exchange: the Monitor attempt uses the clusterTime from
-        # the previous isMaster error.
-        request = server.receives('ismaster')
-        self.assertEqual(request['$clusterTime']['clusterTime'],
-                         cluster_time)
-        request.reply(reply)
+        for _ in range(3):
+            request = server.receives("ismaster")
+            # No $clusterTime in heartbeats or handshakes.
+            self.assertNotIn("$clusterTime", request)
+            request.ok(reply)
         client.close()
 
+    def test_collection_bulk_error(self):
+        def callback(client: MongoClient[dict]) -> None:
+            with self.assertRaises(OperationFailure):
+                client.db.collection.bulk_write([InsertOne({}), InsertOne({})])
 
-if __name__ == '__main__':
+        self.cluster_time_conversation(
+            callback,
+            [{"ok": 0, "errmsg": "mock error"}],
+        )
+
+    def test_client_bulk_error(self):
+        def callback(client: MongoClient[dict]) -> None:
+            with self.assertRaises(OperationFailure):
+                client.bulk_write(
+                    [
+                        InsertOne({}, namespace="db.collection"),
+                        InsertOne({}, namespace="db.collection"),
+                    ]
+                )
+
+        self.cluster_time_conversation(
+            callback, [{"ok": 0, "errmsg": "mock error"}], max_wire_version=25
+        )
+
+
+if __name__ == "__main__":
     unittest.main()

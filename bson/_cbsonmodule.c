@@ -26,7 +26,6 @@
 
 #include "buffer.h"
 #include "time64.h"
-#include "encoding_helpers.h"
 
 #define _CBSON_MODULE
 #include "_cbsonmodule.h"
@@ -53,7 +52,38 @@ struct module_state {
     PyObject* BSONInt64;
     PyObject* Decimal128;
     PyObject* Mapping;
-    PyObject* CodecOptions;
+    PyObject* DatetimeMS;
+    PyObject* min_datetime;
+    PyObject* max_datetime;
+    PyObject* replace_args;
+    PyObject* replace_kwargs;
+    PyObject* _type_marker_str;
+    PyObject* _flags_str;
+    PyObject* _pattern_str;
+    PyObject* _encoder_map_str;
+    PyObject* _decoder_map_str;
+    PyObject* _fallback_encoder_str;
+    PyObject* _raw_str;
+    PyObject* _subtype_str;
+    PyObject* _binary_str;
+    PyObject* _scope_str;
+    PyObject* _inc_str;
+    PyObject* _time_str;
+    PyObject* _bid_str;
+    PyObject* _replace_str;
+    PyObject* _astimezone_str;
+    PyObject* _id_str;
+    PyObject* _dollar_ref_str;
+    PyObject* _dollar_id_str;
+    PyObject* _dollar_db_str;
+    PyObject* _tzinfo_str;
+    PyObject* _as_doc_str;
+    PyObject* _utcoffset_str;
+    PyObject* _from_uuid_str;
+    PyObject* _as_uuid_str;
+    PyObject* _from_bid_str;
+    int64_t min_millis;
+    int64_t max_millis;
 };
 
 #define GETSTATE(m) ((struct module_state*)PyModule_GetState(m))
@@ -74,11 +104,111 @@ struct module_state {
 /* The smallest possible BSON document, i.e. "{}" */
 #define BSON_MIN_SIZE 5
 
+/* Datetime codec options */
+#define DATETIME 1
+#define DATETIME_CLAMP 2
+#define DATETIME_MS 3
+#define DATETIME_AUTO 4
+#define PYTHON_3_12 0x030C0000
+
+/* Converts integer to its string representation in decimal notation. */
+extern int cbson_long_long_to_str(long long num, char* str, size_t size) {
+    // Buffer should fit 64-bit signed integer
+    if (size < 21) {
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "Buffer too small to hold long long: %d < 21", size);
+        return -1;
+    }
+    int index = 0;
+    int sign = 1;
+    // Convert to unsigned to handle -LLONG_MIN overflow
+    unsigned long long absNum;
+    // Handle the case of 0
+    if (num == 0) {
+        str[index++] = '0';
+        str[index] = '\0';
+        return 0;
+    }
+    // Handle negative numbers
+    if (num < 0) {
+        sign = -1;
+        absNum = 0ULL - (unsigned long long)num;
+    } else {
+        absNum = (unsigned long long)num;
+    }
+    // Convert the number to string
+    unsigned long long digit;
+    while (absNum > 0) {
+        digit = absNum % 10ULL;
+        str[index++] = (char)digit + '0';  // Convert digit to character
+        absNum /= 10;
+    }
+    // Add minus sign if negative
+    if (sign == -1) {
+        str[index++] = '-';
+    }
+    str[index] = '\0';  // Null terminator
+    // Reverse the string
+    int start = 0;
+    int end = index - 1;
+    while (start < end) {
+        char temp = str[start];
+        str[start++] = str[end];
+        str[end--] = temp;
+    }
+    return 0;
+}
+
+static PyObject* _test_long_long_to_str(PyObject* self, PyObject* args) {
+    // Test extreme values
+    Py_ssize_t maxNum = PY_SSIZE_T_MAX;
+    Py_ssize_t minNum = PY_SSIZE_T_MIN;
+    Py_ssize_t num;
+    char str_1[BUF_SIZE];
+    char str_2[BUF_SIZE];
+    int res = LL2STR(str_1, (long long)minNum);
+    if (res == -1) {
+        return NULL;
+    }
+    INT2STRING(str_2, (long long)minNum);
+    if (strcmp(str_1, str_2) != 0) {
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "LL2STR != INT2STRING: %s != %s", str_1, str_2);
+        return NULL;
+    }
+    LL2STR(str_1, (long long)maxNum);
+    INT2STRING(str_2, (long long)maxNum);
+    if (strcmp(str_1, str_2) != 0) {
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "LL2STR != INT2STRING: %s != %s", str_1, str_2);
+        return NULL;
+    }
+
+    // Test common values
+    for (num = 0; num < 10000; num++) {
+        char str_1[BUF_SIZE];
+        char str_2[BUF_SIZE];
+        LL2STR(str_1, (long long)num);
+        INT2STRING(str_2, (long long)num);
+        if (strcmp(str_1, str_2) != 0) {
+            PyErr_Format(
+                PyExc_RuntimeError,
+                "LL2STR != INT2STRING: %s != %s", str_1, str_2);
+            return NULL;
+        }
+    }
+
+    return args;
+}
+
 /* Get an error class from the bson.errors module.
  *
  * Returns a new ref */
 static PyObject* _error(char* name) {
-    PyObject* error;
+    PyObject* error = NULL;
     PyObject* errors = PyImport_ImportModule("bson.errors");
     if (!errors) {
         return NULL;
@@ -118,7 +248,68 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
 /* Write a RawBSONDocument to the buffer.
  * Returns the number of bytes written or 0 on failure.
  */
-static int write_raw_doc(buffer_t buffer, PyObject* raw);
+static int write_raw_doc(buffer_t buffer, PyObject* raw, PyObject* _raw);
+
+#if PY_VERSION_HEX >= PYTHON_3_12
+/* Transfer traceback from old_exc to new_exc.
+ * Steals reference to old_exc. */
+static PyObject* _transfer_traceback(PyObject *old_exc, PyObject *new_exc) {
+    PyObject *tb = PyException_GetTraceback(old_exc);
+    if (tb) {
+        PyException_SetTraceback(new_exc, tb);
+        Py_DECREF(tb);
+    }
+    Py_DECREF(old_exc);
+    return new_exc;
+}
+#endif
+
+/* Rewrap the current exception as InvalidBSON(str(e)) if it is not already an InvalidBSON error. */
+static void _rewrap_as_invalid_bson(void) {
+#if PY_VERSION_HEX >= PYTHON_3_12
+    PyObject *exc = PyErr_GetRaisedException();
+    if (exc && PyErr_GivenExceptionMatches(exc, PyExc_Exception)) {
+        PyObject *InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            if (!PyErr_GivenExceptionMatches(exc, InvalidBSON)) {
+                PyObject *err_msg = PyObject_Str(exc);
+                if (err_msg) {
+                    PyObject *new_exc = PyObject_CallOneArg(InvalidBSON, err_msg);
+                    if (new_exc) {
+                        exc = _transfer_traceback(exc, new_exc);
+                    }
+                }
+                Py_XDECREF(err_msg);
+            }
+            Py_DECREF(InvalidBSON);
+        }
+    }
+    /* Steals reference to exc. */
+    PyErr_SetRaisedException(exc);
+#else
+    PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
+    PyObject *InvalidBSON = NULL;
+    PyErr_Fetch(&etype, &evalue, &etrace);
+    if (PyErr_GivenExceptionMatches(etype, PyExc_Exception)) {
+        InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            if (!PyErr_GivenExceptionMatches(etype, InvalidBSON)) {
+                Py_DECREF(etype);
+                etype = InvalidBSON;
+                if (evalue) {
+                    PyObject *msg = PyObject_Str(evalue);
+                    Py_DECREF(evalue);
+                    evalue = msg;
+                }
+                PyErr_NormalizeException(&etype, &evalue, &etrace);
+            } else {
+                Py_DECREF(InvalidBSON);
+            }
+        }
+    }
+    PyErr_Restore(etype, evalue, etrace);
+#endif
+}
 
 /* Date stuff */
 static PyObject* datetime_from_millis(long long millis) {
@@ -128,7 +319,7 @@ static PyObject* datetime_from_millis(long long millis) {
      * 2. Multiply that by 1000:                  253402300799000
      * 3. Add in microseconds divided by 1000     253402300799999
      *
-     * (Note: BSON doesn't support microsecond accuracy, hence the rounding.)
+     * (Note: BSON doesn't support microsecond accuracy, hence the truncation.)
      *
      * To decode we could do:
      * 1. Get seconds: timestamp / 1000:          253402300799
@@ -150,19 +341,74 @@ static PyObject* datetime_from_millis(long long millis) {
      * micros = diff * 1000                       111000
      * Resulting in datetime(1, 1, 1, 1, 1, 1, 111000) -- the expected result
      */
+    PyObject* datetime = NULL;
     int diff = (int)(((millis % 1000) + 1000) % 1000);
     int microseconds = diff * 1000;
     Time64_T seconds = (millis - diff) / 1000;
     struct TM timeinfo;
-    gmtime64_r(&seconds, &timeinfo);
+    cbson_gmtime64_r(&seconds, &timeinfo);
 
-    return PyDateTime_FromDateAndTime(timeinfo.tm_year + 1900,
-                                      timeinfo.tm_mon + 1,
-                                      timeinfo.tm_mday,
-                                      timeinfo.tm_hour,
-                                      timeinfo.tm_min,
-                                      timeinfo.tm_sec,
-                                      microseconds);
+    datetime = PyDateTime_FromDateAndTime(timeinfo.tm_year + 1900,
+                                          timeinfo.tm_mon + 1,
+                                          timeinfo.tm_mday,
+                                          timeinfo.tm_hour,
+                                          timeinfo.tm_min,
+                                          timeinfo.tm_sec,
+                                          microseconds);
+    if(!datetime) {
+        #if PY_VERSION_HEX >= PYTHON_3_12
+            PyObject *exc = PyErr_GetRaisedException();
+
+            /* Only add additional error message on ValueError exceptions. */
+            if (exc && PyErr_GivenExceptionMatches(exc, PyExc_ValueError)) {
+                PyObject* err_msg = PyObject_Str(exc);
+                if (err_msg) {
+                    PyObject* appendage = PyUnicode_FromString(" (Consider Using CodecOptions(datetime_conversion=DATETIME_AUTO) or MongoClient(datetime_conversion='DATETIME_AUTO')). See: https://www.mongodb.com/docs/languages/python/pymongo-driver/current/data-formats/dates-and-times/#handling-out-of-range-datetimes");
+                    if (appendage) {
+                        PyObject* msg = PyUnicode_Concat(err_msg, appendage);
+                        if (msg) {
+                            PyObject* new_exc = PyObject_CallOneArg(PyExc_ValueError, msg);
+                            if (new_exc) {
+                                exc = _transfer_traceback(exc, new_exc);
+                            }
+                            Py_DECREF(msg);
+                        }
+                    }
+                    Py_XDECREF(appendage);
+                }
+                Py_XDECREF(err_msg);
+            }
+            /* Steals reference to exc. */
+            PyErr_SetRaisedException(exc);
+        #else
+            /* Calling _error clears the error state, so fetch it first.*/
+            PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
+            PyErr_Fetch(&etype, &evalue, &etrace);
+
+            /* Only add additional error message on ValueError exceptions. */
+            if (PyErr_GivenExceptionMatches(etype, PyExc_ValueError)) {
+                if (evalue) {
+                    PyObject* err_msg = PyObject_Str(evalue);
+                    if (err_msg) {
+                        PyObject* appendage = PyUnicode_FromString(" (Consider Using CodecOptions(datetime_conversion=DATETIME_AUTO) or MongoClient(datetime_conversion='DATETIME_AUTO')). See: https://www.mongodb.com/docs/languages/python/pymongo-driver/current/data-formats/dates-and-times/#handling-out-of-range-datetimes");
+                        if (appendage) {
+                            PyObject* msg = PyUnicode_Concat(err_msg, appendage);
+                            if (msg) {
+                                Py_DECREF(evalue);
+                                evalue = msg;
+                            }
+                        }
+                        Py_XDECREF(appendage);
+                    }
+                    Py_XDECREF(err_msg);
+                }
+                PyErr_NormalizeException(&etype, &evalue, &etrace);
+            }
+            /* Steals references to args. */
+            PyErr_Restore(etype, evalue, etrace);
+        #endif
+    }
+    return datetime;
 }
 
 static long long millis_from_datetime(PyObject* datetime) {
@@ -176,14 +422,170 @@ static long long millis_from_datetime(PyObject* datetime) {
     timeinfo.tm_min = PyDateTime_DATE_GET_MINUTE(datetime);
     timeinfo.tm_sec = PyDateTime_DATE_GET_SECOND(datetime);
 
-    millis = timegm64(&timeinfo) * 1000;
+    millis = cbson_timegm64(&timeinfo) * 1000;
     millis += PyDateTime_DATE_GET_MICROSECOND(datetime) / 1000;
     return millis;
 }
 
+/* Extended-range datetime, returns a DatetimeMS object with millis */
+static PyObject* datetime_ms_from_millis(PyObject* self, long long millis){
+    // Allocate a new DatetimeMS object.
+    struct module_state *state = GETSTATE(self);
+    if (!state) {
+        return NULL;
+    }
+
+    PyObject* dt = NULL;
+    PyObject* ll_millis = NULL;
+
+    if (!(ll_millis = PyLong_FromLongLong(millis))){
+        return NULL;
+    }
+    PyObject* args[1] = {ll_millis};
+    dt = PyObject_Vectorcall(state->DatetimeMS, args, 1, NULL);
+    Py_DECREF(ll_millis);
+    return dt;
+}
+
+/* Extended-range datetime, takes a DatetimeMS object and extracts the long long value. */
+static int millis_from_datetime_ms(PyObject* dt, long long* out){
+    PyObject* ll_millis;
+    long long millis;
+
+    if (!(ll_millis = PyNumber_Long(dt))){
+        return 0;
+    }
+    millis = PyLong_AsLongLong(ll_millis);
+    Py_DECREF(ll_millis);
+    if (millis == -1 && PyErr_Occurred()) { /* Overflow */
+        PyErr_SetString(PyExc_OverflowError,
+                        "MongoDB datetimes can only handle up to 8-byte ints");
+        return 0;
+    }
+    *out = millis;
+    return 1;
+}
+
+static PyObject* decode_datetime(PyObject* self, long long millis, const codec_options_t* options){
+    PyObject* naive = NULL;
+    PyObject* replace = NULL;
+    PyObject* value = NULL;
+    struct module_state *state = GETSTATE(self);
+    if (!state) {
+        goto invalid;
+    }
+    if (options->datetime_conversion == DATETIME_MS){
+        return datetime_ms_from_millis(self, millis);
+    }
+
+    int dt_clamp = options->datetime_conversion == DATETIME_CLAMP;
+    int dt_auto = options->datetime_conversion == DATETIME_AUTO;
+
+    if (dt_clamp || dt_auto){
+        int64_t min_millis = state->min_millis;
+        int64_t max_millis = state->max_millis;
+        int64_t min_millis_offset = 0;
+        int64_t max_millis_offset = 0;
+        if (options->tz_aware && options->tzinfo && options->tzinfo != Py_None) {
+            PyObject* utcoffset_args[2] = {options->tzinfo, state->min_datetime};
+            PyObject* utcoffset = PyObject_VectorcallMethod(
+                state->_utcoffset_str, utcoffset_args, 2, NULL);
+            if (utcoffset == NULL) {
+                return 0;
+            }
+            if (utcoffset != Py_None) {
+                if (!PyDelta_Check(utcoffset)) {
+                    PyObject* BSONError = _error("BSONError");
+                    if (BSONError) {
+                        PyErr_SetString(BSONError, "tzinfo.utcoffset() did not return a datetime.timedelta");
+                        Py_DECREF(BSONError);
+                    }
+                    Py_DECREF(utcoffset);
+                    return 0;
+                }
+                min_millis_offset = (PyDateTime_DELTA_GET_DAYS(utcoffset) * (int64_t)86400 +
+                                     PyDateTime_DELTA_GET_SECONDS(utcoffset)) * (int64_t)1000 +
+                                     (PyDateTime_DELTA_GET_MICROSECONDS(utcoffset) / 1000);
+            }
+            Py_DECREF(utcoffset);
+            utcoffset_args[1] = state->max_datetime;
+            utcoffset = PyObject_VectorcallMethod(
+                state->_utcoffset_str, utcoffset_args, 2, NULL);
+            if (utcoffset == NULL) {
+                return 0;
+            }
+            if (utcoffset != Py_None) {
+                if (!PyDelta_Check(utcoffset)) {
+                    PyObject* BSONError = _error("BSONError");
+                    if (BSONError) {
+                        PyErr_SetString(BSONError, "tzinfo.utcoffset() did not return a datetime.timedelta");
+                        Py_DECREF(BSONError);
+                    }
+                    Py_DECREF(utcoffset);
+                    return 0;
+                }
+                max_millis_offset = (PyDateTime_DELTA_GET_DAYS(utcoffset) * (int64_t)86400 +
+                                     PyDateTime_DELTA_GET_SECONDS(utcoffset)) * (int64_t)1000 +
+                                     (PyDateTime_DELTA_GET_MICROSECONDS(utcoffset) / 1000);
+            }
+            Py_DECREF(utcoffset);
+        }
+        if (min_millis_offset < 0) {
+            min_millis -= min_millis_offset;
+        }
+
+        if (max_millis_offset > 0) {
+            max_millis -= max_millis_offset;
+        }
+
+        if (dt_clamp) {
+            if (millis < min_millis) {
+                millis = min_millis;
+            } else if (millis > max_millis) {
+                millis = max_millis;
+            }
+            // Continues from here to return a datetime.
+        } else { // dt_auto
+            if (millis < min_millis || millis > max_millis){
+                return datetime_ms_from_millis(self, millis);
+            }
+        }
+    }
+
+    naive = datetime_from_millis(millis);
+    if (!naive) {
+        goto invalid;
+    }
+
+    if (!options->tz_aware) { /* In the naive case, we're done here. */
+        return naive;
+    }
+    replace = PyObject_GetAttr(naive, state->_replace_str);
+    if (!replace) {
+        goto invalid;
+    }
+    value = PyObject_Call(replace, state->replace_args, state->replace_kwargs);
+    if (!value) {
+        goto invalid;
+    }
+
+    /* convert to local time */
+    if (options->tzinfo != Py_None) {
+        PyObject* astimezone_args[2] = {value, options->tzinfo};
+        PyObject* temp = PyObject_VectorcallMethod(
+            state->_astimezone_str, astimezone_args, 2, NULL);
+        Py_DECREF(value);
+        value = temp;
+    }
+invalid:
+    Py_XDECREF(naive);
+    Py_XDECREF(replace);
+    return value;
+}
+
 /* Just make this compatible w/ the old API. */
 int buffer_write_bytes(buffer_t buffer, const char* data, int size) {
-    if (buffer_write(buffer, data, size)) {
+    if (pymongo_buffer_write(buffer, data, size)) {
         return 0;
     }
     return 1;
@@ -208,7 +610,7 @@ void buffer_write_int32_at_position(buffer_t buffer,
                                     int position,
                                     int32_t data) {
     uint32_t data_le = BSON_UINT32_TO_LE(data);
-    memcpy(buffer_get_buffer(buffer) + position, &data_le, 4);
+    memcpy(pymongo_buffer_get_buffer(buffer) + position, &data_le, 4);
 }
 
 static int write_unicode(buffer_t buffer, PyObject* py_string) {
@@ -263,49 +665,6 @@ static int write_string(buffer_t buffer, PyObject* py_string) {
     return 1;
 }
 
-/*
- * Are we in the main interpreter or a sub-interpreter?
- * Useful for deciding if we can use cached pure python
- * types in mod_wsgi.
- */
-static int
-_in_main_interpreter(void) {
-    static PyInterpreterState* main_interpreter = NULL;
-    PyInterpreterState* interpreter;
-
-    if (main_interpreter == NULL) {
-        interpreter = PyInterpreterState_Head();
-
-        while (PyInterpreterState_Next(interpreter))
-            interpreter = PyInterpreterState_Next(interpreter);
-
-        main_interpreter = interpreter;
-    }
-
-    return (main_interpreter == PyThreadState_Get()->interp);
-}
-
-/*
- * Get a reference to a pure python type. If we are in the
- * main interpreter return the cached object, otherwise import
- * the object we need and return it instead.
- */
-static PyObject*
-_get_object(PyObject* object, char* module_name, char* object_name) {
-    if (_in_main_interpreter()) {
-        Py_XINCREF(object);
-        return object;
-    } else {
-        PyObject* imported = NULL;
-        PyObject* module = PyImport_ImportModule(module_name);
-        if (!module)
-            return NULL;
-        imported = PyObject_GetAttrString(module, object_name);
-        Py_DECREF(module);
-        return imported;
-    }
-}
-
 /* Load a Python object to cache.
  *
  * Returns non-zero on failure. */
@@ -330,7 +689,41 @@ static int _load_python_objects(PyObject* module) {
     PyObject* empty_string = NULL;
     PyObject* re_compile = NULL;
     PyObject* compiled = NULL;
+    PyObject* min_datetime_ms = NULL;
+    PyObject* max_datetime_ms = NULL;
     struct module_state *state = GETSTATE(module);
+    if (!state) {
+        return 1;
+    }
+
+    /* Cache commonly used attribute names to improve performance. */
+    if (!((state->_type_marker_str = PyUnicode_FromString("_type_marker")) &&
+        (state->_flags_str = PyUnicode_FromString("flags")) &&
+        (state->_pattern_str = PyUnicode_FromString("pattern")) &&
+        (state->_encoder_map_str = PyUnicode_FromString("_encoder_map")) &&
+        (state->_decoder_map_str = PyUnicode_FromString("_decoder_map")) &&
+        (state->_fallback_encoder_str = PyUnicode_FromString("_fallback_encoder")) &&
+        (state->_raw_str = PyUnicode_FromString("raw")) &&
+        (state->_subtype_str = PyUnicode_FromString("subtype")) &&
+        (state->_binary_str = PyUnicode_FromString("binary")) &&
+        (state->_scope_str = PyUnicode_FromString("scope")) &&
+        (state->_inc_str = PyUnicode_FromString("inc")) &&
+        (state->_time_str = PyUnicode_FromString("time")) &&
+        (state->_bid_str = PyUnicode_FromString("bid")) &&
+        (state->_replace_str = PyUnicode_FromString("replace")) &&
+        (state->_astimezone_str = PyUnicode_FromString("astimezone")) &&
+        (state->_id_str = PyUnicode_FromString("_id")) &&
+        (state->_dollar_ref_str = PyUnicode_FromString("$ref")) &&
+        (state->_dollar_id_str = PyUnicode_FromString("$id")) &&
+        (state->_dollar_db_str = PyUnicode_FromString("$db")) &&
+        (state->_tzinfo_str = PyUnicode_FromString("tzinfo")) &&
+        (state->_as_doc_str = PyUnicode_FromString("as_doc")) &&
+        (state->_utcoffset_str = PyUnicode_FromString("utcoffset")) &&
+        (state->_from_uuid_str = PyUnicode_FromString("from_uuid")) &&
+        (state->_as_uuid_str = PyUnicode_FromString("as_uuid")) &&
+        (state->_from_bid_str = PyUnicode_FromString("from_bid")))) {
+            return 1;
+    }
 
     if (_load_object(&state->Binary, "bson.binary", "Binary") ||
         _load_object(&state->Code, "bson.code", "Code") ||
@@ -345,9 +738,35 @@ static int _load_python_objects(PyObject* module) {
         _load_object(&state->Decimal128, "bson.decimal128", "Decimal128") ||
         _load_object(&state->UUID, "uuid", "UUID") ||
         _load_object(&state->Mapping, "collections.abc", "Mapping") ||
-        _load_object(&state->CodecOptions, "bson.codec_options", "CodecOptions")) {
+        _load_object(&state->DatetimeMS, "bson.datetime_ms", "DatetimeMS") ||
+        _load_object(&min_datetime_ms, "bson.datetime_ms", "_MIN_UTC_MS") ||
+        _load_object(&max_datetime_ms, "bson.datetime_ms", "_MAX_UTC_MS") ||
+        _load_object(&state->min_datetime, "bson.datetime_ms", "_MIN_UTC") ||
+        _load_object(&state->max_datetime, "bson.datetime_ms", "_MAX_UTC")) {
         return 1;
     }
+
+    state->min_millis = PyLong_AsLongLong(min_datetime_ms);
+    state->max_millis = PyLong_AsLongLong(max_datetime_ms);
+    Py_DECREF(min_datetime_ms);
+    Py_DECREF(max_datetime_ms);
+    if ((state->min_millis == -1 || state->max_millis == -1) && PyErr_Occurred()) {
+        return 1;
+    }
+
+    /* Speed up datetime.replace(tzinfo=utc) call */
+    state->replace_args = PyTuple_New(0);
+    if (!state->replace_args) {
+        return 1;
+    }
+    state->replace_kwargs = PyDict_New();
+    if (!state->replace_kwargs) {
+        return 1;
+    }
+    if (PyDict_SetItem(state->replace_kwargs, state->_tzinfo_str, state->UTC) == -1) {
+        return 1;
+    }
+
     /* Reload our REType hack too. */
     empty_string = PyBytes_FromString("");
     if (empty_string == NULL) {
@@ -361,7 +780,8 @@ static int _load_python_objects(PyObject* module) {
         return 1;
     }
 
-    compiled = PyObject_CallFunction(re_compile, "O", empty_string);
+    PyObject* compile_args[1] = {empty_string};
+    compiled = PyObject_Vectorcall(re_compile, compile_args, 1, NULL);
     Py_DECREF(re_compile);
     if (compiled == NULL) {
         state->REType = NULL;
@@ -380,17 +800,23 @@ static int _load_python_objects(PyObject* module) {
  *
  * Return the type marker, 0 if there is no marker, or -1 on failure.
  */
-static long _type_marker(PyObject* object) {
+static long _type_marker(PyObject* object, PyObject* _type_marker_str) {
     PyObject* type_marker = NULL;
     long type = 0;
 
-    if (PyObject_HasAttrString(object, "_type_marker")) {
-        type_marker = PyObject_GetAttrString(object, "_type_marker");
-        if (type_marker == NULL) {
+    #if PY_VERSION_HEX >= 0x030D0000
+        // 3.13
+        if (PyObject_GetOptionalAttr(object, _type_marker_str, &type_marker) == -1) {
             return -1;
         }
-    }
-
+    # else
+        if (PyObject_HasAttr(object, _type_marker_str)) {
+            type_marker = PyObject_GetAttr(object, _type_marker_str);
+            if (type_marker == NULL) {
+                return -1;
+            }
+        }
+    #endif
     /*
      * Python objects with broken __getattr__ implementations could return
      * arbitrary types for a call to PyObject_GetAttrString. For example
@@ -402,13 +828,6 @@ static long _type_marker(PyObject* object) {
     if (type_marker && PyLong_CheckExact(type_marker)) {
         type = PyLong_AsLong(type_marker);
         Py_DECREF(type_marker);
-        /*
-         * Py(Long|Int)_AsLong returns -1 for error but -1 is a valid value
-         * so we call PyErr_Occurred to differentiate.
-         */
-        if (type == -1 && PyErr_Occurred()) {
-            return -1;
-        }
     } else {
         Py_XDECREF(type_marker);
     }
@@ -421,25 +840,25 @@ static long _type_marker(PyObject* object) {
  * Return 1 on success. options->document_class is a new reference.
  * Return 0 on failure.
  */
-int convert_type_registry(PyObject* registry_obj, type_registry_t* registry) {
+int cbson_convert_type_registry(PyObject* registry_obj, type_registry_t* registry, PyObject* _encoder_map_str, PyObject* _decoder_map_str, PyObject* _fallback_encoder_str) {
     registry->encoder_map = NULL;
     registry->decoder_map = NULL;
     registry->fallback_encoder = NULL;
     registry->registry_obj = NULL;
 
-    registry->encoder_map = PyObject_GetAttrString(registry_obj, "_encoder_map");
+    registry->encoder_map = PyObject_GetAttr(registry_obj, _encoder_map_str);
     if (registry->encoder_map == NULL) {
         goto fail;
     }
     registry->is_encoder_empty = (PyDict_Size(registry->encoder_map) == 0);
 
-    registry->decoder_map = PyObject_GetAttrString(registry_obj, "_decoder_map");
+    registry->decoder_map = PyObject_GetAttr(registry_obj, _decoder_map_str);
     if (registry->decoder_map == NULL) {
         goto fail;
     }
     registry->is_decoder_empty = (PyDict_Size(registry->decoder_map) == 0);
 
-    registry->fallback_encoder = PyObject_GetAttrString(registry_obj, "_fallback_encoder");
+    registry->fallback_encoder = PyObject_GetAttr(registry_obj, _fallback_encoder_str);
     if (registry->fallback_encoder == NULL) {
         goto fail;
     }
@@ -456,39 +875,45 @@ fail:
     return 0;
 }
 
-/* Fill out a codec_options_t* from a CodecOptions object. Use with the "O&"
- * format spec in PyArg_ParseTuple.
+/* Fill out a codec_options_t* from a CodecOptions object.
  *
  * Return 1 on success. options->document_class is a new reference.
  * Return 0 on failure.
  */
-int convert_codec_options(PyObject* options_obj, void* p) {
-    codec_options_t* options = (codec_options_t*)p;
+int convert_codec_options(PyObject* self, PyObject* options_obj, codec_options_t* options) {
     PyObject* type_registry_obj = NULL;
+    struct module_state *state = GETSTATE(self);
     long type_marker;
+    if (!state) {
+        return 0;
+    }
 
     options->unicode_decode_error_handler = NULL;
 
-    if (!PyArg_ParseTuple(options_obj, "ObbzOO",
+    if (!PyArg_ParseTuple(options_obj, "ObbzOOb",
                           &options->document_class,
                           &options->tz_aware,
                           &options->uuid_rep,
                           &options->unicode_decode_error_handler,
                           &options->tzinfo,
-                          &type_registry_obj))
+                          &type_registry_obj,
+                          &options->datetime_conversion)) {
         return 0;
+    }
 
-    type_marker = _type_marker(options->document_class);
+    type_marker = _type_marker(options->document_class,
+                               state->_type_marker_str);
     if (type_marker < 0) {
         return 0;
     }
 
-    if (!convert_type_registry(type_registry_obj,
-                               &options->type_registry)) {
+    if (!cbson_convert_type_registry(type_registry_obj,
+                               &options->type_registry, state->_encoder_map_str, state->_decoder_map_str, state->_fallback_encoder_str)) {
         return 0;
     }
 
     options->is_raw_bson = (101 == type_marker);
+    options->is_dict_class = (options->document_class == (PyObject*)&PyDict_Type);
     options->options_obj = options_obj;
 
     Py_INCREF(options->options_obj);
@@ -496,26 +921,6 @@ int convert_codec_options(PyObject* options_obj, void* p) {
     Py_INCREF(options->tzinfo);
 
     return 1;
-}
-
-/* Fill out a codec_options_t* with default options.
- *
- * Return 1 on success.
- * Return 0 on failure.
- */
-int default_codec_options(struct module_state* state, codec_options_t* options) {
-    PyObject* options_obj = NULL;
-    PyObject* codec_options_func = _get_object(
-        state->CodecOptions, "bson.codec_options", "CodecOptions");
-    if (codec_options_func == NULL) {
-        return 0;
-    }
-    options_obj = PyObject_CallFunctionObjArgs(codec_options_func, NULL);
-    Py_DECREF(codec_options_func);
-    if (options_obj == NULL) {
-        return 0;
-    }
-    return convert_codec_options(options_obj, options);
 }
 
 void destroy_codec_options(codec_options_t* options) {
@@ -547,6 +952,13 @@ static int write_element_to_buffer(PyObject* self, buffer_t buffer,
 
 static void
 _set_cannot_encode(PyObject* value) {
+    if (PyLong_Check(value)) {
+        if ((PyLong_AsLongLong(value) == -1) && PyErr_Occurred()) {
+            return PyErr_SetString(PyExc_OverflowError,
+                    "MongoDB can only handle up to 8-byte ints");
+        }
+    }
+
     PyObject* type = NULL;
     PyObject* InvalidDocument = _error("InvalidDocument");
     if (InvalidDocument == NULL) {
@@ -570,23 +982,23 @@ error:
  * Sets exception and returns 0 on failure.
  */
 static int _write_regex_to_buffer(
-    buffer_t buffer, int type_byte, PyObject* value) {
+    buffer_t buffer, int type_byte, PyObject* value, PyObject* _flags_str, PyObject* _pattern_str) {
 
     PyObject* py_flags;
     PyObject* py_pattern;
     PyObject* encoded_pattern;
+    PyObject* decoded_pattern;
     long int_flags;
     char flags[FLAGS_SIZE];
     char check_utf8 = 0;
     const char* pattern_data;
     int pattern_length, flags_length;
-    result_t status;
 
     /*
      * Both the builtin re type and our Regex class have attributes
      * "flags" and "pattern".
      */
-    py_flags = PyObject_GetAttrString(value, "flags");
+    py_flags = PyObject_GetAttr(value, _flags_str);
     if (!py_flags) {
         return 0;
     }
@@ -595,7 +1007,7 @@ static int _write_regex_to_buffer(
     if (int_flags == -1 && PyErr_Occurred()) {
         return 0;
     }
-    py_pattern = PyObject_GetAttrString(value, "pattern");
+    py_pattern = PyObject_GetAttr(value, _pattern_str);
     if (!py_pattern) {
         return 0;
     }
@@ -619,18 +1031,8 @@ static int _write_regex_to_buffer(
         Py_DECREF(encoded_pattern);
         return 0;
     }
-    status = check_string((const unsigned char*)pattern_data,
-                          pattern_length, check_utf8, 1);
-    if (status == NOT_UTF_8) {
-        PyObject* InvalidStringData = _error("InvalidStringData");
-        if (InvalidStringData) {
-            PyErr_SetString(InvalidStringData,
-                            "regex patterns must be valid UTF-8");
-            Py_DECREF(InvalidStringData);
-        }
-        Py_DECREF(encoded_pattern);
-        return 0;
-    } else if (status == HAS_NULL) {
+
+    if (strlen(pattern_data) != (size_t) pattern_length){
         PyObject* InvalidDocument = _error("InvalidDocument");
         if (InvalidDocument) {
             PyErr_SetString(InvalidDocument,
@@ -639,6 +1041,22 @@ static int _write_regex_to_buffer(
         }
         Py_DECREF(encoded_pattern);
         return 0;
+    }
+
+    if (check_utf8) {
+        decoded_pattern = PyUnicode_DecodeUTF8(pattern_data, (Py_ssize_t) pattern_length, NULL);
+        if (decoded_pattern == NULL) {
+            PyErr_Clear();
+            PyObject* InvalidStringData = _error("InvalidStringData");
+            if (InvalidStringData) {
+                PyErr_SetString(InvalidStringData,
+                                "regex patterns must be valid UTF-8");
+                Py_DECREF(InvalidStringData);
+            }
+            Py_DECREF(encoded_pattern);
+            return 0;
+        }
+        Py_DECREF(decoded_pattern);
     }
 
     if (!buffer_write_bytes(buffer, pattern_data, pattern_length + 1)) {
@@ -671,7 +1089,7 @@ static int _write_regex_to_buffer(
     if (!buffer_write_bytes(buffer, flags, flags_length)) {
         return 0;
     }
-    *(buffer_get_buffer(buffer) + type_byte) = 0x0B;
+    *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x0B;
     return 1;
 }
 
@@ -685,19 +1103,30 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                                     const codec_options_t* options,
                                     unsigned char in_custom_call,
                                     unsigned char in_fallback_call) {
-    struct module_state *state = GETSTATE(self);
-    PyObject* mapping_type;
     PyObject* new_value = NULL;
     int retval;
-    PyObject* uuid_type;
-    /*
-     * Don't use PyObject_IsInstance for our custom types. It causes
-     * problems with python sub interpreters. Our custom types should
-     * have a _type_marker attribute, which we can switch on instead.
-     */
-    long type = _type_marker(value);
-    if (type < 0) {
+    int is_list;
+    long type;
+    struct module_state *state = GETSTATE(self);
+    if (!state) {
         return 0;
+    }
+    /*
+     * Use _type_marker attribute instead of PyObject_IsInstance for better perf.
+     *
+     * Skip _type_marker lookup for common built-in types
+     * that we know don't have a _type_marker attribute. This avoids the overhead
+     * of PyObject_HasAttr/PyObject_GetAttr calls for the most common cases.
+     */
+    if (PyUnicode_CheckExact(value) || PyLong_CheckExact(value) || PyFloat_CheckExact(value) ||
+        PyBool_Check(value) || PyDict_CheckExact(value) || PyList_CheckExact(value) ||
+        PyTuple_CheckExact(value) || PyBytes_CheckExact(value) || value == Py_None) {
+        type = 0;
+    } else {
+        type = _type_marker(value, state->_type_marker_str);
+        if (type < 0) {
+            return 0;
+        }
     }
 
     switch (type) {
@@ -709,8 +1138,8 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             const char* data;
             int size;
 
-            *(buffer_get_buffer(buffer) + type_byte) = 0x05;
-            subtype_object = PyObject_GetAttrString(value, "subtype");
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x05;
+            subtype_object = PyObject_GetAttr(value, state->_subtype_str);
             if (!subtype_object) {
                 return 0;
             }
@@ -758,7 +1187,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
         {
             /* ObjectId */
             const char* data;
-            PyObject* pystring = PyObject_GetAttrString(value, "binary");
+            PyObject* pystring = PyObject_GetAttr(value, state->_binary_str);
             if (!pystring) {
                 return 0;
             }
@@ -772,13 +1201,23 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                 return 0;
             }
             Py_DECREF(pystring);
-            *(buffer_get_buffer(buffer) + type_byte) = 0x07;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x07;
             return 1;
+        }
+    case 9:
+        {
+            /* DatetimeMS */
+            long long millis;
+            if (!millis_from_datetime_ms(value, &millis)) {
+                return 0;
+            }
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x09;
+            return buffer_write_int64(buffer, (int64_t)millis);
         }
     case 11:
         {
             /* Regex */
-            return _write_regex_to_buffer(buffer, type_byte, value);
+            return _write_regex_to_buffer(buffer, type_byte, value, state->_flags_str, state->_pattern_str);
         }
     case 13:
         {
@@ -787,22 +1226,22 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                 length_location,
                 length;
 
-            PyObject* scope = PyObject_GetAttrString(value, "scope");
+            PyObject* scope = PyObject_GetAttr(value, state->_scope_str);
             if (!scope) {
                 return 0;
             }
 
             if (scope == Py_None) {
                 Py_DECREF(scope);
-                *(buffer_get_buffer(buffer) + type_byte) = 0x0D;
+                *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x0D;
                 return write_string(buffer, value);
             }
 
-            *(buffer_get_buffer(buffer) + type_byte) = 0x0F;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x0F;
 
-            start_position = buffer_get_position(buffer);
+            start_position = pymongo_buffer_get_position(buffer);
             /* save space for length */
-            length_location = buffer_save_space(buffer, 4);
+            length_location = pymongo_buffer_save_space(buffer, 4);
             if (length_location == -1) {
                 Py_DECREF(scope);
                 return 0;
@@ -819,7 +1258,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             }
             Py_DECREF(scope);
 
-            length = buffer_get_position(buffer) - start_position;
+            length = pymongo_buffer_get_position(buffer) - start_position;
             buffer_write_int32_at_position(
                 buffer, length_location, (int32_t)length);
             return 1;
@@ -830,7 +1269,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             PyObject* obj;
             unsigned long i;
 
-            obj = PyObject_GetAttrString(value, "inc");
+            obj = PyObject_GetAttr(value, state->_inc_str);
             if (!obj) {
                 return 0;
             }
@@ -843,7 +1282,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                 return 0;
             }
 
-            obj = PyObject_GetAttrString(value, "time");
+            obj = PyObject_GetAttr(value, state->_time_str);
             if (!obj) {
                 return 0;
             }
@@ -856,7 +1295,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                 return 0;
             }
 
-            *(buffer_get_buffer(buffer) + type_byte) = 0x11;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x11;
             return 1;
         }
     case 18:
@@ -871,14 +1310,14 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             if (!buffer_write_int64(buffer, (int64_t)ll)) {
                 return 0;
             }
-            *(buffer_get_buffer(buffer) + type_byte) = 0x12;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x12;
             return 1;
         }
     case 19:
         {
             /* Decimal128 */
             const char* data;
-            PyObject* pystring = PyObject_GetAttrString(value, "bid");
+            PyObject* pystring = PyObject_GetAttr(value, state->_bid_str);
             if (!pystring) {
                 return 0;
             }
@@ -892,13 +1331,15 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                 return 0;
             }
             Py_DECREF(pystring);
-            *(buffer_get_buffer(buffer) + type_byte) = 0x13;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x13;
             return 1;
         }
     case 100:
         {
             /* DBRef */
-            PyObject* as_doc = PyObject_CallMethod(value, "as_doc", NULL);
+            PyObject* as_doc_args[1] = {value};
+            PyObject* as_doc = PyObject_VectorcallMethod(
+                state->_as_doc_str, as_doc_args, 1, NULL);
             if (!as_doc) {
                 return 0;
             }
@@ -907,84 +1348,82 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                 return 0;
             }
             Py_DECREF(as_doc);
-            *(buffer_get_buffer(buffer) + type_byte) = 0x03;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x03;
             return 1;
         }
     case 101:
         {
             /* RawBSONDocument */
-            if (!write_raw_doc(buffer, value)) {
+            if (!write_raw_doc(buffer, value, state->_raw_str)) {
                 return 0;
             }
-            *(buffer_get_buffer(buffer) + type_byte) = 0x03;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x03;
             return 1;
         }
     case 255:
         {
             /* MinKey */
-            *(buffer_get_buffer(buffer) + type_byte) = 0xFF;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0xFF;
             return 1;
         }
     case 127:
         {
             /* MaxKey */
-            *(buffer_get_buffer(buffer) + type_byte) = 0x7F;
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x7F;
             return 1;
         }
     }
 
-    /* No _type_marker attibute or not one of our types. */
+    /* No _type_marker attribute or not one of our types. */
 
     if (PyBool_Check(value)) {
         const char c = (value == Py_True) ? 0x01 : 0x00;
-        *(buffer_get_buffer(buffer) + type_byte) = 0x08;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x08;
         return buffer_write_bytes(buffer, &c, 1);
     }
     else if (PyLong_Check(value)) {
-        const long long_value = PyLong_AsLong(value);
-
-        const int int_value = (int)long_value;
-        if (PyErr_Occurred() || long_value != int_value) { /* Overflow */
-            long long long_long_value;
+        const long long long_long_value = PyLong_AsLongLong(value);
+        if (long_long_value == -1 && PyErr_Occurred()) {
+            /* Ignore error and give the fallback_encoder a chance. */
             PyErr_Clear();
-            long_long_value = PyLong_AsLongLong(value);
-            if (PyErr_Occurred()) { /* Overflow AGAIN */
-                PyErr_SetString(PyExc_OverflowError,
-                                "MongoDB can only handle up to 8-byte ints");
-                return 0;
-            }
-            *(buffer_get_buffer(buffer) + type_byte) = 0x12;
+        } else if (-2147483648LL <= long_long_value && long_long_value <= 2147483647LL) {
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x10;
+            return buffer_write_int32(buffer, (int32_t)long_long_value);
+        } else {
+            *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x12;
             return buffer_write_int64(buffer, (int64_t)long_long_value);
         }
-        *(buffer_get_buffer(buffer) + type_byte) = 0x10;
-        return buffer_write_int32(buffer, (int32_t)int_value);
     } else if (PyFloat_Check(value)) {
         const double d = PyFloat_AsDouble(value);
-        *(buffer_get_buffer(buffer) + type_byte) = 0x01;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x01;
         return buffer_write_double(buffer, d);
     } else if (value == Py_None) {
-        *(buffer_get_buffer(buffer) + type_byte) = 0x0A;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x0A;
         return 1;
     } else if (PyDict_Check(value)) {
-        *(buffer_get_buffer(buffer) + type_byte) = 0x03;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x03;
         return write_dict(self, buffer, value, check_keys, options, 0);
-    } else if (PyList_Check(value) || PyTuple_Check(value)) {
+    } else if ((is_list = PyList_Check(value)) || PyTuple_Check(value)) {
         Py_ssize_t items, i;
         int start_position,
             length_location,
             length;
         char zero = 0;
 
-        *(buffer_get_buffer(buffer) + type_byte) = 0x04;
-        start_position = buffer_get_position(buffer);
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x04;
+        start_position = pymongo_buffer_get_position(buffer);
 
         /* save space for length */
-        length_location = buffer_save_space(buffer, 4);
+        length_location = pymongo_buffer_save_space(buffer, 4);
         if (length_location == -1) {
             return 0;
         }
-
-        if ((items = PySequence_Size(value)) > BSON_MAX_SIZE) {
+        if (is_list) {
+            items = PyList_Size(value);
+        } else {
+            items = PyTuple_Size(value);
+        }
+        if (items > BSON_MAX_SIZE) {
             PyObject* BSONError = _error("BSONError");
             if (BSONError) {
                 PyErr_SetString(BSONError,
@@ -994,34 +1433,40 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             return 0;
         }
         for(i = 0; i < items; i++) {
-            int list_type_byte = buffer_save_space(buffer, 1);
-            char name[16];
+            int list_type_byte = pymongo_buffer_save_space(buffer, 1);
+            char name[BUF_SIZE];
             PyObject* item_value;
 
             if (list_type_byte == -1) {
                 return 0;
             }
-            INT2STRING(name, (int)i);
+            int res = LL2STR(name, (long long)i);
+            if (res == -1) {
+                return 0;
+            }
             if (!buffer_write_bytes(buffer, name, (int)strlen(name) + 1)) {
                 return 0;
             }
-
-            if (!(item_value = PySequence_GetItem(value, i)))
+            if (is_list) {
+                item_value = PyList_GET_ITEM(value, i);
+            } else {
+                item_value = PyTuple_GET_ITEM(value, i);
+            }
+            if (!item_value) {
                 return 0;
+            }
             if (!write_element_to_buffer(self, buffer, list_type_byte,
                                          item_value, check_keys, options,
                                          0, 0)) {
-                Py_DECREF(item_value);
                 return 0;
             }
-            Py_DECREF(item_value);
         }
 
         /* write null byte and fill in length */
         if (!buffer_write_bytes(buffer, &zero, 1)) {
             return 0;
         }
-        length = buffer_get_position(buffer) - start_position;
+        length = pymongo_buffer_get_position(buffer) - start_position;
         buffer_write_int32_at_position(
             buffer, length_location, (int32_t)length);
         return 1;
@@ -1034,7 +1479,7 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
             return 0;
         if ((size = _downcast_and_check(PyBytes_GET_SIZE(value), 0)) == -1)
             return 0;
-        *(buffer_get_buffer(buffer) + type_byte) = 0x05;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x05;
         if (!buffer_write_int32(buffer, (int32_t)size)) {
             return 0;
         }
@@ -1046,17 +1491,19 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
         }
         return 1;
     } else if (PyUnicode_Check(value)) {
-        *(buffer_get_buffer(buffer) + type_byte) = 0x02;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x02;
         return write_unicode(buffer, value);
     } else if (PyDateTime_Check(value)) {
         long long millis;
-        PyObject* utcoffset = PyObject_CallMethod(value, "utcoffset", NULL);
+        PyObject* utcoffset_args[1] = {value};
+        PyObject* utcoffset = PyObject_VectorcallMethod(
+            state->_utcoffset_str, utcoffset_args, 1, NULL);
         if (utcoffset == NULL)
             return 0;
         if (utcoffset != Py_None) {
             PyObject* result = PyNumber_Subtract(value, utcoffset);
-            Py_DECREF(utcoffset);
             if (!result) {
+                Py_DECREF(utcoffset);
                 return 0;
             }
             millis = millis_from_datetime(result);
@@ -1064,47 +1511,37 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
         } else {
             millis = millis_from_datetime(value);
         }
-        *(buffer_get_buffer(buffer) + type_byte) = 0x09;
+        Py_DECREF(utcoffset);
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x09;
         return buffer_write_int64(buffer, (int64_t)millis);
     } else if (PyObject_TypeCheck(value, state->REType)) {
-        return _write_regex_to_buffer(buffer, type_byte, value);
-    }
-
-    /*
-     * Try Mapping and UUID last since we have to import
-     * them if we're in a sub-interpreter.
-     */
-    mapping_type = _get_object(state->Mapping, "collections.abc", "Mapping");
-    if (mapping_type && PyObject_IsInstance(value, mapping_type)) {
-        Py_DECREF(mapping_type);
+        return _write_regex_to_buffer(buffer, type_byte, value, state->_flags_str, state->_pattern_str);
+    } else if (PyObject_IsInstance(value, state->Mapping)) {
         /* PyObject_IsInstance returns -1 on error */
         if (PyErr_Occurred()) {
             return 0;
         }
-        *(buffer_get_buffer(buffer) + type_byte) = 0x03;
+        *(pymongo_buffer_get_buffer(buffer) + type_byte) = 0x03;
         return write_dict(self, buffer, value, check_keys, options, 0);
-    }
-
-    uuid_type = _get_object(state->UUID, "uuid", "UUID");
-    if (uuid_type && PyObject_IsInstance(value, uuid_type)) {
-        PyObject* binary_type = NULL;
+    } else if (PyObject_IsInstance(value, state->UUID)) {
         PyObject* binary_value = NULL;
+        PyObject *uuid_rep_obj = NULL;
         int result;
 
-        Py_DECREF(uuid_type);
         /* PyObject_IsInstance returns -1 on error */
         if (PyErr_Occurred()) {
             return 0;
         }
 
-        binary_type = _get_object(state->Binary, "bson", "Binary");
-        if (binary_type == NULL) {
+        if (!(uuid_rep_obj = PyLong_FromLong(options->uuid_rep))) {
             return 0;
         }
+        PyObject* from_uuid_args[3] = {state->Binary, value, uuid_rep_obj};
+        binary_value = PyObject_VectorcallMethod(
+            state->_from_uuid_str, from_uuid_args, 3, NULL);
+        Py_DECREF(uuid_rep_obj);
 
-        binary_value = PyObject_CallMethod(binary_type, "from_uuid", "(Oi)", value, options->uuid_rep);
         if (binary_value == NULL) {
-            Py_DECREF(binary_type);
             return 0;
         }
 
@@ -1113,12 +1550,9 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
                                           check_keys, options,
                                           in_custom_call,
                                           in_fallback_call);
-        Py_DECREF(binary_type);
         Py_DECREF(binary_value);
         return result;
     }
-    Py_XDECREF(mapping_type);
-    Py_XDECREF(uuid_type);
 
     /* Try a custom encoder if one is provided and we have not already
      * attempted to use a type encoder. */
@@ -1134,7 +1568,8 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
         if (converter != NULL) {
             /* Transform types that have a registered converter.
              * A new reference is created upon transformation. */
-            new_value = PyObject_CallFunctionObjArgs(converter, value, NULL);
+            PyObject* converter_args[1] = {value};
+            new_value = PyObject_Vectorcall(converter, converter_args, 1, NULL);
             if (new_value == NULL) {
                 return 0;
             }
@@ -1148,8 +1583,9 @@ static int _write_element_to_buffer(PyObject* self, buffer_t buffer,
     /* Try the fallback encoder if one is provided and we have not already
      * attempted to use the fallback encoder. */
     if (!in_fallback_call && options->type_registry.has_fallback_encoder) {
-        new_value = PyObject_CallFunctionObjArgs(
-            options->type_registry.fallback_encoder, value, NULL);
+        PyObject* fallback_args[1] = {value};
+        new_value = PyObject_Vectorcall(
+            options->type_registry.fallback_encoder, fallback_args, 1, NULL);
         if (new_value == NULL) {
             // propagate any exception raised by the callback
             return 0;
@@ -1211,7 +1647,7 @@ int write_pair(PyObject* self, buffer_t buffer, const char* name, int name_lengt
         return 1;
     }
 
-    type_byte = buffer_save_space(buffer, 1);
+    type_byte = pymongo_buffer_save_space(buffer, 1);
     if (type_byte == -1) {
         return 0;
     }
@@ -1298,14 +1734,14 @@ int decode_and_write_pair(PyObject* self, buffer_t buffer,
 /* Write a RawBSONDocument to the buffer.
  * Returns the number of bytes written or 0 on failure.
  */
-static int write_raw_doc(buffer_t buffer, PyObject* raw) {
+static int write_raw_doc(buffer_t buffer, PyObject* raw, PyObject* _raw_str) {
     char* bytes;
     Py_ssize_t len;
     int len_int;
     int bytes_written = 0;
     PyObject* bytes_obj = NULL;
 
-    bytes_obj = PyObject_GetAttrString(raw, "raw");
+    bytes_obj = PyObject_GetAttr(raw, _raw_str);
     if (!bytes_obj) {
         goto fail;
     }
@@ -1326,6 +1762,96 @@ fail:
     return bytes_written;
 }
 
+
+/* Update Invalid Document error to include doc as a property.
+ */
+void handle_invalid_doc_error(PyObject* dict) {
+#if PY_VERSION_HEX >= PYTHON_3_12
+    PyObject *exc = PyErr_GetRaisedException();
+    PyObject *msg = NULL, *new_msg = NULL;
+    PyObject *InvalidDocument = NULL;
+
+    if (exc == NULL) {
+        return;
+    }
+
+    InvalidDocument = _error("InvalidDocument");
+    if (InvalidDocument == NULL) {
+        goto cleanup;
+    }
+
+    if (PyErr_GivenExceptionMatches(exc, InvalidDocument)) {
+        msg = PyObject_Str(exc);
+        if (msg) {
+            const char *msg_utf8 = PyUnicode_AsUTF8(msg);
+            if (msg_utf8 == NULL) {
+                goto cleanup;
+            }
+            new_msg = PyUnicode_FromFormat("Invalid document: %s", msg_utf8);
+            if (new_msg == NULL) {
+                goto cleanup;
+            }
+            /* Add doc to the error instance as a property. */
+            PyObject* exc_args[2] = {new_msg, dict};
+            PyObject* new_exc = PyObject_Vectorcall(InvalidDocument, exc_args, 2, NULL);
+            if (new_exc) {
+                exc = _transfer_traceback(exc, new_exc);
+            }
+        }
+    }
+cleanup:
+    /* Steals reference to exc. */
+    PyErr_SetRaisedException(exc);
+    Py_XDECREF(msg);
+    Py_XDECREF(InvalidDocument);
+    Py_XDECREF(new_msg);
+#else
+    PyObject *etype = NULL, *evalue = NULL, *etrace = NULL;
+    PyObject *msg = NULL, *new_msg = NULL, *new_evalue = NULL;
+    PyErr_Fetch(&etype, &evalue, &etrace);
+    PyObject *InvalidDocument = _error("InvalidDocument");
+    if (InvalidDocument == NULL) {
+        goto cleanup;
+    }
+
+    if (evalue && PyErr_GivenExceptionMatches(etype, InvalidDocument)) {
+        msg = PyObject_Str(evalue);
+        if (msg) {
+            const char * msg_utf8 = PyUnicode_AsUTF8(msg);
+            if (msg_utf8 == NULL) {
+                goto cleanup;
+            }
+            new_msg = PyUnicode_FromFormat("Invalid document: %s", msg_utf8);
+            if (new_msg == NULL) {
+                goto cleanup;
+            }
+            // Add doc to the error instance as a property.
+            PyObject* exc_args[2] = {new_msg, dict};
+            new_evalue = PyObject_Vectorcall(InvalidDocument, exc_args, 2, NULL);
+            Py_DECREF(evalue);
+            Py_DECREF(etype);
+            etype = InvalidDocument;
+            InvalidDocument = NULL;
+            if (new_evalue) {
+                evalue = new_evalue;
+                new_evalue = NULL;
+            } else {
+                evalue = msg;
+                msg = NULL;
+            }
+        }
+        PyErr_NormalizeException(&etype, &evalue, &etrace);
+    }
+cleanup:
+    PyErr_Restore(etype, evalue, etrace);
+    Py_XDECREF(msg);
+    Py_XDECREF(InvalidDocument);
+    Py_XDECREF(new_evalue);
+    Py_XDECREF(new_msg);
+#endif
+}
+
+
 /* returns the number of bytes written or 0 on failure */
 int write_dict(PyObject* self, buffer_t buffer,
                PyObject* dict, unsigned char check_keys,
@@ -1336,25 +1862,25 @@ int write_dict(PyObject* self, buffer_t buffer,
     int length;
     int length_location;
     struct module_state *state = GETSTATE(self);
-    PyObject* mapping_type;
     long type_marker;
-
-    /* check for RawBSONDocument */
-    type_marker = _type_marker(dict);
-    if (type_marker < 0) {
+    int is_dict = PyDict_Check(dict);
+    if (!state) {
         return 0;
     }
 
-    if (101 == type_marker) {
-        return write_raw_doc(buffer, dict);
-    }
+    if (!is_dict) {
+        /* check for RawBSONDocument */
+        type_marker = _type_marker(dict, state->_type_marker_str);
+        if (type_marker < 0) {
+            return 0;
+        }
 
-    mapping_type = _get_object(state->Mapping, "collections.abc", "Mapping");
+        if (101 == type_marker) {
+            return write_raw_doc(buffer, dict, state->_raw_str);
+        }
 
-    if (mapping_type) {
-        if (!PyObject_IsInstance(dict, mapping_type)) {
+        if (!PyObject_IsInstance(dict, state->Mapping)) {
             PyObject* repr;
-            Py_DECREF(mapping_type);
             if ((repr = PyObject_Repr(dict))) {
                 PyObject* errmsg = PyUnicode_FromString(
                     "encoder expected a mapping type but got: ");
@@ -1377,14 +1903,13 @@ int write_dict(PyObject* self, buffer_t buffer,
 
             return 0;
         }
-        Py_DECREF(mapping_type);
         /* PyObject_IsInstance returns -1 on error */
         if (PyErr_Occurred()) {
             return 0;
         }
     }
 
-    length_location = buffer_save_space(buffer, 4);
+    length_location = pymongo_buffer_save_space(buffer, 4);
     if (length_location == -1) {
         return 0;
     }
@@ -1393,20 +1918,20 @@ int write_dict(PyObject* self, buffer_t buffer,
     if (top_level) {
         /*
          * If "dict" is a defaultdict we don't want to call
-         * PyMapping_GetItemString on it. That would **create**
+         * PyObject_GetItem on it. That would **create**
          * an _id where one didn't previously exist (PYTHON-871).
          */
-        if (PyDict_Check(dict)) {
-            /* PyDict_GetItemString returns a borrowed reference. */
-            PyObject* _id = PyDict_GetItemString(dict, "_id");
+        if (is_dict) {
+            /* PyDict_GetItem returns a borrowed reference. */
+            PyObject* _id = PyDict_GetItem(dict, state->_id_str);
             if (_id) {
                 if (!write_pair(self, buffer, "_id", 3,
                                 _id, check_keys, options, 1)) {
                     return 0;
                 }
             }
-        } else if (PyMapping_HasKeyString(dict, "_id")) {
-            PyObject* _id = PyMapping_GetItemString(dict, "_id");
+        } else if (PyMapping_HasKey(dict, state->_id_str)) {
+            PyObject* _id = PyObject_GetItem(dict, state->_id_str);
             if (!_id) {
                 return 0;
             }
@@ -1415,43 +1940,60 @@ int write_dict(PyObject* self, buffer_t buffer,
                 Py_DECREF(_id);
                 return 0;
             }
-            /* PyMapping_GetItemString returns a new reference. */
+            /* PyObject_GetItem returns a new reference. */
             Py_DECREF(_id);
         }
     }
 
-    iter = PyObject_GetIter(dict);
-    if (iter == NULL) {
-        return 0;
-    }
-    while ((key = PyIter_Next(iter)) != NULL) {
-        PyObject* value = PyObject_GetItem(dict, key);
-        if (!value) {
-            PyErr_SetObject(PyExc_KeyError, key);
-            Py_DECREF(key);
-            Py_DECREF(iter);
+    if (is_dict) {
+        PyObject* value;
+        Py_ssize_t pos = 0;
+        while (PyDict_Next(dict, &pos, &key, &value)) {
+            if (!decode_and_write_pair(self, buffer, key, value,
+                                    check_keys, options, top_level)) {
+                if (PyErr_Occurred() && top_level) {
+                    handle_invalid_doc_error(dict);
+                }
+                return 0;
+            }
+        }
+    } else {
+        iter = PyObject_GetIter(dict);
+        if (iter == NULL) {
             return 0;
         }
-        if (!decode_and_write_pair(self, buffer, key, value,
-                                   check_keys, options, top_level)) {
+        while ((key = PyIter_Next(iter)) != NULL) {
+            PyObject* value = PyObject_GetItem(dict, key);
+            if (!value) {
+                PyErr_SetObject(PyExc_KeyError, key);
+                Py_DECREF(key);
+                Py_DECREF(iter);
+                return 0;
+            }
+            if (!decode_and_write_pair(self, buffer, key, value,
+                                    check_keys, options, top_level)) {
+                if (PyErr_Occurred() && top_level) {
+                    handle_invalid_doc_error(dict);
+                }
+                Py_DECREF(key);
+                Py_DECREF(value);
+                Py_DECREF(iter);
+                return 0;
+            }
             Py_DECREF(key);
             Py_DECREF(value);
-            Py_DECREF(iter);
+        }
+        Py_DECREF(iter);
+        if (PyErr_Occurred()) {
             return 0;
         }
-        Py_DECREF(key);
-        Py_DECREF(value);
-    }
-    Py_DECREF(iter);
-    if (PyErr_Occurred()) {
-        return 0;
     }
 
     /* write null byte and fill in length */
     if (!buffer_write_bytes(buffer, &zero, 1)) {
         return 0;
     }
-    length = buffer_get_position(buffer) - length_location;
+    length = pymongo_buffer_get_position(buffer) - length_location;
     buffer_write_int32_at_position(
         buffer, length_location, (int32_t)length);
     return length;
@@ -1462,31 +2004,37 @@ static PyObject* _cbson_dict_to_bson(PyObject* self, PyObject* args) {
     PyObject* result;
     unsigned char check_keys;
     unsigned char top_level = 1;
+    PyObject* options_obj = NULL;
     codec_options_t options;
     buffer_t buffer;
     PyObject* raw_bson_document_bytes_obj;
     long type_marker;
+    struct module_state *state = GETSTATE(self);
+    if (!state) {
+        return NULL;
+    }
 
-    if (!PyArg_ParseTuple(args, "ObO&|b", &dict, &check_keys,
-                          convert_codec_options, &options, &top_level)) {
+    if (!(PyArg_ParseTuple(args, "ObO|b", &dict, &check_keys,
+                          &options_obj, &top_level) &&
+            convert_codec_options(self, options_obj, &options))) {
         return NULL;
     }
 
     /* check for RawBSONDocument */
-    type_marker = _type_marker(dict);
+    type_marker = _type_marker(dict, state->_type_marker_str);
     if (type_marker < 0) {
         destroy_codec_options(&options);
         return NULL;
     } else if (101 == type_marker) {
         destroy_codec_options(&options);
-        raw_bson_document_bytes_obj = PyObject_GetAttrString(dict, "raw");
+        raw_bson_document_bytes_obj = PyObject_GetAttr(dict, state->_raw_str);
         if (NULL == raw_bson_document_bytes_obj) {
             return NULL;
         }
         return raw_bson_document_bytes_obj;
     }
 
-    buffer = buffer_new();
+    buffer = pymongo_buffer_new();
     if (!buffer) {
         destroy_codec_options(&options);
         return NULL;
@@ -1494,15 +2042,15 @@ static PyObject* _cbson_dict_to_bson(PyObject* self, PyObject* args) {
 
     if (!write_dict(self, buffer, dict, check_keys, &options, top_level)) {
         destroy_codec_options(&options);
-        buffer_free(buffer);
+        pymongo_buffer_free(buffer);
         return NULL;
     }
 
     /* objectify buffer */
-    result = Py_BuildValue("y#", buffer_get_buffer(buffer),
-                           (Py_ssize_t)buffer_get_position(buffer));
+    result = Py_BuildValue("y#", pymongo_buffer_get_buffer(buffer),
+                           (Py_ssize_t)pymongo_buffer_get_position(buffer));
     destroy_codec_options(&options);
-    buffer_free(buffer);
+    pymongo_buffer_free(buffer);
     return result;
 }
 
@@ -1511,29 +2059,30 @@ static PyObject* _cbson_dict_to_bson(PyObject* self, PyObject* args) {
  */
 static PyObject *_dbref_hook(PyObject* self, PyObject* value) {
     struct module_state *state = GETSTATE(self);
-    PyObject* dbref = NULL;
-    PyObject* dbref_type = NULL;
     PyObject* ref = NULL;
     PyObject* id = NULL;
     PyObject* database = NULL;
     PyObject* ret = NULL;
     int db_present = 0;
+    if (!state) {
+        return NULL;
+    }
 
     /* Decoding for DBRefs */
-    if (PyMapping_HasKeyString(value, "$ref") && PyMapping_HasKeyString(value, "$id")) { /* DBRef */
-        ref = PyMapping_GetItemString(value, "$ref");
-        /* PyMapping_GetItemString returns NULL to indicate error. */
+    if (PyMapping_HasKey(value, state->_dollar_ref_str) && PyMapping_HasKey(value, state->_dollar_id_str)) { /* DBRef */
+        ref = PyObject_GetItem(value, state->_dollar_ref_str);
+        /* PyObject_GetItem returns NULL to indicate error. */
         if (!ref) {
             goto invalid;
         }
-        id = PyMapping_GetItemString(value, "$id");
-        /* PyMapping_GetItemString returns NULL to indicate error. */
+        id = PyObject_GetItem(value, state->_dollar_id_str);
+        /* PyObject_GetItem returns NULL to indicate error. */
         if (!id) {
             goto invalid;
         }
 
-        if (PyMapping_HasKeyString(value, "$db")) {
-            database = PyMapping_GetItemString(value, "$db");
+        if (PyMapping_HasKey(value, state->_dollar_db_str)) {
+            database = PyObject_GetItem(value, state->_dollar_db_str);
             if (!database) {
                 goto invalid;
             }
@@ -1549,22 +2098,19 @@ static PyObject *_dbref_hook(PyObject* self, PyObject* value) {
             goto invalid;
         }
 
-        PyMapping_DelItemString(value, "$ref");
-        PyMapping_DelItemString(value, "$id");
+        PyMapping_DelItem(value, state->_dollar_ref_str);
+        PyMapping_DelItem(value, state->_dollar_id_str);
         if (db_present) {
-            PyMapping_DelItemString(value, "$db");
+            PyMapping_DelItem(value, state->_dollar_db_str);
         }
 
-        if ((dbref_type = _get_object(state->DBRef, "bson.dbref", "DBRef"))) {
-            dbref = PyObject_CallFunctionObjArgs(dbref_type, ref, id, database, value, NULL);
-            Py_DECREF(value);
-            ret = dbref;
-        }
+        PyObject* dbref_args[4] = {ref, id, database, value};
+        ret = PyObject_Vectorcall(state->DBRef, dbref_args, 4, NULL);
+        Py_DECREF(value);
     } else {
         ret = value;
     }
 invalid:
-    Py_XDECREF(dbref_type);
     Py_XDECREF(ref);
     Py_XDECREF(id);
     Py_XDECREF(database);
@@ -1573,9 +2119,12 @@ invalid:
 
 static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                            unsigned* position, unsigned char type,
-                           unsigned max, const codec_options_t* options) {
+                           unsigned max, const codec_options_t* options, int raw_array) {
     struct module_state *state = GETSTATE(self);
     PyObject* value = NULL;
+    if (!state) {
+        return NULL;
+    }
     switch (type) {
     case 1:
         {
@@ -1632,21 +2181,15 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                 goto invalid;
             }
 
-            if (options->is_raw_bson) {
-                value = PyObject_CallFunction(
-                    options->document_class, "y#O",
-                    buffer + *position, (Py_ssize_t)size, options->options_obj);
-                if (!value) {
-                    goto invalid;
-                }
-                *position += size;
-                break;
-            }
-
-            value = elements_to_dict(self, buffer + *position + 4,
-                                     size - 5, options);
+            value = elements_to_dict(self, buffer + *position,
+                                     size, options);
             if (!value) {
                 goto invalid;
+            }
+
+            if (options->is_raw_bson) {
+                *position += size;
+                break;
             }
 
             /* Hook for DBRefs */
@@ -1670,11 +2213,20 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             if (size < BSON_MIN_SIZE || max < size) {
                 goto invalid;
             }
+
             end = *position + size - 1;
             /* Check for bad eoo */
             if (buffer[end]) {
                 goto invalid;
             }
+
+            if (raw_array != 0) {
+                // Treat it as a binary buffer.
+                value = PyBytes_FromStringAndSize(buffer + *position, size);
+                *position += size;
+                break;
+            }
+
             *position += 4;
 
             value = PyList_New(0);
@@ -1698,7 +2250,7 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                     goto invalid;
                 }
                 to_append = get_value(self, name, buffer, position, bson_type,
-                                      max - (unsigned)key_size, options);
+                                      max - (unsigned)key_size, options, raw_array);
                 Py_LeaveRecursiveCall();
                 if (!to_append) {
                     Py_DECREF(value);
@@ -1721,7 +2273,6 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
         {
             PyObject* data;
             PyObject* st;
-            PyObject* type_to_create;
             uint32_t length, length2;
             unsigned char subtype;
 
@@ -1730,7 +2281,7 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             }
             memcpy(&length, buffer + *position, 4);
             length = BSON_UINT32_FROM_LE(length);
-            if (max < length) {
+            if (max - 5 < length) { // Account for 5-byte header. max >= 5 guaranteed above
                 goto invalid;
             }
 
@@ -1762,7 +2313,6 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             }
             /* Encode as UUID or Binary based on options->uuid_rep */
             if (subtype == 3 || subtype == 4) {
-                PyObject* binary_type = NULL;
                 PyObject* binary_value = NULL;
                 char uuid_rep = options->uuid_rep;
 
@@ -1771,12 +2321,13 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                     goto uuiderror;
                 }
 
-                binary_type = _get_object(state->Binary, "bson", "Binary");
-                if (binary_type == NULL) {
+                PyObject* subtype_obj = PyLong_FromLong(subtype);
+                if (!subtype_obj) {
                     goto uuiderror;
                 }
-
-                binary_value = PyObject_CallFunction(binary_type, "(Oi)", data, subtype);
+                PyObject* binary_args[2] = {data, subtype_obj};
+                binary_value = PyObject_Vectorcall(state->Binary, binary_args, 2, NULL);
+                Py_DECREF(subtype_obj);
                 if (binary_value == NULL) {
                     goto uuiderror;
                 }
@@ -1787,11 +2338,17 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                     value = binary_value;
                     Py_INCREF(value);
                 } else {
-                    value = PyObject_CallMethod(binary_value, "as_uuid", "(i)", uuid_rep);
+                    PyObject *uuid_rep_obj = PyLong_FromLong(uuid_rep);
+                    if (!uuid_rep_obj) {
+                        goto uuiderror;
+                    }
+                    PyObject* as_uuid_args[2] = {binary_value, uuid_rep_obj};
+                    value = PyObject_VectorcallMethod(
+                        state->_as_uuid_str, as_uuid_args, 2, NULL);
+                    Py_DECREF(uuid_rep_obj);
                 }
 
             uuiderror:
-                Py_XDECREF(binary_type);
                 Py_XDECREF(binary_value);
                 Py_DECREF(data);
                 if (!value) {
@@ -1806,10 +2363,8 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                 Py_DECREF(data);
                 goto invalid;
             }
-            if ((type_to_create = _get_object(state->Binary, "bson.binary", "Binary"))) {
-                value = PyObject_CallFunctionObjArgs(type_to_create, data, st, NULL);
-                Py_DECREF(type_to_create);
-            }
+            PyObject* binary_args[2] = {data, st};
+            value = PyObject_Vectorcall(state->Binary, binary_args, 2, NULL);
             Py_DECREF(st);
             Py_DECREF(data);
             if (!value) {
@@ -1827,15 +2382,16 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
         }
     case 7:
         {
-            PyObject* objectid_type;
             if (max < 12) {
                 goto invalid;
             }
-            if ((objectid_type = _get_object(state->ObjectId, "bson.objectid", "ObjectId"))) {
-                value = PyObject_CallFunction(objectid_type, "y#",
-                                              buffer + *position, (Py_ssize_t)12);
-                Py_DECREF(objectid_type);
+            PyObject* oid_bytes = PyBytes_FromStringAndSize(buffer + *position, 12);
+            if (!oid_bytes) {
+                goto invalid;
             }
+            PyObject* oid_args[1] = {oid_bytes};
+            value = PyObject_Vectorcall(state->ObjectId, oid_args, 1, NULL);
+            Py_DECREF(oid_bytes);
             *position += 12;
             break;
         }
@@ -1859,83 +2415,19 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
         }
     case 9:
         {
-            PyObject* utc_type;
-            PyObject* naive;
-            PyObject* replace;
-            PyObject* args;
-            PyObject* kwargs;
-            PyObject* astimezone;
             int64_t millis;
             if (max < 8) {
                 goto invalid;
             }
             memcpy(&millis, buffer + *position, 8);
             millis = (int64_t)BSON_UINT64_FROM_LE(millis);
-            naive = datetime_from_millis(millis);
             *position += 8;
-            if (!options->tz_aware) { /* In the naive case, we're done here. */
-                value = naive;
-                break;
-            }
 
-            if (!naive) {
-                goto invalid;
-            }
-            replace = PyObject_GetAttrString(naive, "replace");
-            Py_DECREF(naive);
-            if (!replace) {
-                goto invalid;
-            }
-            args = PyTuple_New(0);
-            if (!args) {
-                Py_DECREF(replace);
-                goto invalid;
-            }
-            kwargs = PyDict_New();
-            if (!kwargs) {
-                Py_DECREF(replace);
-                Py_DECREF(args);
-                goto invalid;
-            }
-            utc_type = _get_object(state->UTC, "bson.tz_util", "utc");
-            if (!utc_type || PyDict_SetItemString(kwargs, "tzinfo", utc_type) == -1) {
-                Py_DECREF(replace);
-                Py_DECREF(args);
-                Py_DECREF(kwargs);
-                Py_XDECREF(utc_type);
-                goto invalid;
-            }
-            Py_XDECREF(utc_type);
-            value = PyObject_Call(replace, args, kwargs);
-            if (!value) {
-                Py_DECREF(replace);
-                Py_DECREF(args);
-                Py_DECREF(kwargs);
-                goto invalid;
-            }
-
-            /* convert to local time */
-            if (options->tzinfo != Py_None) {
-                astimezone = PyObject_GetAttrString(value, "astimezone");
-                Py_DECREF(value);
-                if (!astimezone) {
-                    Py_DECREF(replace);
-                    Py_DECREF(args);
-                    Py_DECREF(kwargs);
-                    goto invalid;
-                }
-                value = PyObject_CallFunctionObjArgs(astimezone, options->tzinfo, NULL);
-                Py_DECREF(astimezone);
-            }
-
-            Py_DECREF(replace);
-            Py_DECREF(args);
-            Py_DECREF(kwargs);
+            value = decode_datetime(self, millis, options);
             break;
         }
     case 11:
         {
-            PyObject* regex_class;
             PyObject* pattern;
             int flags;
             size_t flags_length, i;
@@ -1978,12 +2470,14 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             }
             *position += (unsigned)flags_length + 1;
 
-            regex_class = _get_object(state->Regex, "bson.regex", "Regex");
-            if (regex_class) {
-                value = PyObject_CallFunction(regex_class,
-                                              "Oi", pattern, flags);
-                Py_DECREF(regex_class);
+            PyObject* flags_obj = PyLong_FromLong(flags);
+            if (!flags_obj) {
+                Py_DECREF(pattern);
+                goto invalid;
             }
+            PyObject* regex_args[2] = {pattern, flags_obj};
+            value = PyObject_Vectorcall(state->Regex, regex_args, 2, NULL);
+            Py_DECREF(flags_obj);
             Py_DECREF(pattern);
             break;
         }
@@ -1992,8 +2486,6 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             uint32_t coll_length;
             PyObject* collection;
             PyObject* id = NULL;
-            PyObject* objectid_type;
-            PyObject* dbref_type;
 
             if (max < 4) {
                 goto invalid;
@@ -2018,20 +2510,21 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             }
             *position += coll_length;
 
-            if ((objectid_type = _get_object(state->ObjectId, "bson.objectid", "ObjectId"))) {
-                id = PyObject_CallFunction(objectid_type, "y#",
-                                           buffer + *position, (Py_ssize_t)12);
-                Py_DECREF(objectid_type);
+            PyObject* oid_bytes = PyBytes_FromStringAndSize(buffer + *position, 12);
+            if (!oid_bytes) {
+                Py_DECREF(collection);
+                goto invalid;
             }
+            PyObject* oid_args[1] = {oid_bytes};
+            id = PyObject_Vectorcall(state->ObjectId, oid_args, 1, NULL);
+            Py_DECREF(oid_bytes);
             if (!id) {
                 Py_DECREF(collection);
                 goto invalid;
             }
             *position += 12;
-            if ((dbref_type = _get_object(state->DBRef, "bson.dbref", "DBRef"))) {
-                value = PyObject_CallFunctionObjArgs(dbref_type, collection, id, NULL);
-                Py_DECREF(dbref_type);
-            }
+            PyObject* dbref_args[2] = {collection, id};
+            value = PyObject_Vectorcall(state->DBRef, dbref_args, 2, NULL);
             Py_DECREF(collection);
             Py_DECREF(id);
             break;
@@ -2039,7 +2532,6 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
     case 13:
         {
             PyObject* code;
-            PyObject* code_type;
             uint32_t value_length;
             if (max < 4) {
                 goto invalid;
@@ -2062,10 +2554,8 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
                 goto invalid;
             }
             *position += value_length;
-            if ((code_type = _get_object(state->Code, "bson.code", "Code"))) {
-                value = PyObject_CallFunctionObjArgs(code_type, code, NULL, NULL);
-                Py_DECREF(code_type);
-            }
+            PyObject* code_args[1] = {code};
+            value = PyObject_Vectorcall(state->Code, code_args, 1, NULL);
             Py_DECREF(code);
             break;
         }
@@ -2074,9 +2564,9 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             uint32_t c_w_s_size;
             uint32_t code_size;
             uint32_t scope_size;
+            uint32_t len;
             PyObject* code;
             PyObject* scope;
-            PyObject* code_type;
 
             if (max < 8) {
                 goto invalid;
@@ -2093,7 +2583,8 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             memcpy(&code_size, buffer + *position, 4);
             code_size = BSON_UINT32_FROM_LE(code_size);
             /* code_w_scope length + code length + code + scope length */
-            if (!code_size || max < code_size || max < 4 + 4 + code_size + 4) {
+            len = 4 + 4 + code_size + 4;
+            if (!code_size || max < code_size || max < len || len < code_size) {
                 goto invalid;
             }
             *position += 4;
@@ -2111,12 +2602,9 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
 
             memcpy(&scope_size, buffer + *position, 4);
             scope_size = BSON_UINT32_FROM_LE(scope_size);
-            if (scope_size < BSON_MIN_SIZE) {
-                Py_DECREF(code);
-                goto invalid;
-            }
             /* code length + code + scope length + scope */
-            if ((4 + code_size + 4 + scope_size) != c_w_s_size) {
+            len = 4 + 4 + code_size + scope_size;
+            if (scope_size < BSON_MIN_SIZE || len != c_w_s_size || len < scope_size) {
                 Py_DECREF(code);
                 goto invalid;
             }
@@ -2125,18 +2613,16 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             if (buffer[*position + scope_size - 1]) {
                 goto invalid;
             }
-            scope = elements_to_dict(self, buffer + *position + 4,
-                                     scope_size - 5, options);
+            scope = elements_to_dict(self, buffer + *position,
+                                 scope_size, options);
             if (!scope) {
                 Py_DECREF(code);
                 goto invalid;
             }
             *position += scope_size;
 
-            if ((code_type = _get_object(state->Code, "bson.code", "Code"))) {
-                value = PyObject_CallFunctionObjArgs(code_type, code, scope, NULL);
-                Py_DECREF(code_type);
-            }
+            PyObject* code_scope_args[2] = {code, scope};
+            value = PyObject_Vectorcall(state->Code, code_scope_args, 2, NULL);
             Py_DECREF(code);
             Py_DECREF(scope);
             break;
@@ -2159,7 +2645,6 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
     case 17:
         {
             uint32_t time, inc;
-            PyObject* timestamp_type;
             if (max < 8) {
                 goto invalid;
             }
@@ -2167,66 +2652,64 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             memcpy(&time, buffer + *position + 4, 4);
             inc = BSON_UINT32_FROM_LE(inc);
             time = BSON_UINT32_FROM_LE(time);
-            if ((timestamp_type = _get_object(state->Timestamp, "bson.timestamp", "Timestamp"))) {
-                value = PyObject_CallFunction(timestamp_type, "II", time, inc);
-                Py_DECREF(timestamp_type);
+            PyObject* time_obj = PyLong_FromUnsignedLong(time);
+            if (!time_obj) {
+                goto invalid;
             }
+            PyObject* inc_obj = PyLong_FromUnsignedLong(inc);
+            if (!inc_obj) {
+                Py_DECREF(time_obj);
+                goto invalid;
+            }
+            PyObject* ts_args[2] = {time_obj, inc_obj};
+            value = PyObject_Vectorcall(state->Timestamp, ts_args, 2, NULL);
+            Py_DECREF(time_obj);
+            Py_DECREF(inc_obj);
             *position += 8;
             break;
         }
     case 18:
         {
             int64_t ll;
-            PyObject* bson_int64_type = _get_object(state->BSONInt64,
-                                                    "bson.int64", "Int64");
-            if (!bson_int64_type)
-                goto invalid;
             if (max < 8) {
-                Py_DECREF(bson_int64_type);
                 goto invalid;
             }
             memcpy(&ll, buffer + *position, 8);
             ll = (int64_t)BSON_UINT64_FROM_LE(ll);
-            value = PyObject_CallFunction(bson_int64_type, "L", ll);
+            PyObject* ll_obj = PyLong_FromLongLong(ll);
+            if (!ll_obj) {
+                goto invalid;
+            }
+            PyObject* int64_args[1] = {ll_obj};
+            value = PyObject_Vectorcall(state->BSONInt64, int64_args, 1, NULL);
+            Py_DECREF(ll_obj);
             *position += 8;
-            Py_DECREF(bson_int64_type);
             break;
         }
     case 19:
         {
-            PyObject* dec128;
             if (max < 16) {
                 goto invalid;
             }
-            if ((dec128 = _get_object(state->Decimal128,
-                                      "bson.decimal128",
-                                      "Decimal128"))) {
-                value = PyObject_CallMethod(dec128,
-                                            "from_bid",
-                                            "y#",
-                                            buffer + *position,
-                                            (Py_ssize_t)16);
-                Py_DECREF(dec128);
+            PyObject *_bytes_obj = PyBytes_FromStringAndSize(buffer + *position, (Py_ssize_t)16);
+            if (!_bytes_obj) {
+                goto invalid;
             }
+            PyObject* dec128_args[2] = {state->Decimal128, _bytes_obj};
+            value = PyObject_VectorcallMethod(
+                state->_from_bid_str, dec128_args, 2, NULL);
+            Py_DECREF(_bytes_obj);
             *position += 16;
             break;
         }
     case 255:
         {
-            PyObject* minkey_type = _get_object(state->MinKey, "bson.min_key", "MinKey");
-            if (!minkey_type)
-                goto invalid;
-            value = PyObject_CallFunctionObjArgs(minkey_type, NULL);
-            Py_DECREF(minkey_type);
+            value = PyObject_Vectorcall(state->MinKey, NULL, 0, NULL);
             break;
         }
     case 127:
         {
-            PyObject* maxkey_type = _get_object(state->MaxKey, "bson.max_key", "MaxKey");
-            if (!maxkey_type)
-                goto invalid;
-            value = PyObject_CallFunctionObjArgs(maxkey_type, NULL);
-            Py_DECREF(maxkey_type);
+            value = PyObject_Vectorcall(state->MaxKey, NULL, 0, NULL);
             break;
         }
     default:
@@ -2278,7 +2761,8 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
             }
             converter = PyDict_GetItem(options->type_registry.decoder_map, value_type);
             if (converter != NULL) {
-                PyObject* new_value = PyObject_CallFunctionObjArgs(converter, value, NULL);
+                PyObject* converter_args[1] = {value};
+                PyObject* new_value = PyObject_Vectorcall(converter, converter_args, 1, NULL);
                 Py_DECREF(value_type);
                 Py_DECREF(value);
                 return new_value;
@@ -2296,42 +2780,7 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
      * Wrap any non-InvalidBSON errors in InvalidBSON.
      */
     if (PyErr_Occurred()) {
-        PyObject *etype, *evalue, *etrace;
-        PyObject *InvalidBSON;
-
-        /*
-         * Calling _error clears the error state, so fetch it first.
-         */
-        PyErr_Fetch(&etype, &evalue, &etrace);
-
-        /* Dont reraise anything but PyExc_Exceptions as InvalidBSON. */
-        if (PyErr_GivenExceptionMatches(etype, PyExc_Exception)) {
-            InvalidBSON = _error("InvalidBSON");
-            if (InvalidBSON) {
-                if (!PyErr_GivenExceptionMatches(etype, InvalidBSON)) {
-                    /*
-                     * Raise InvalidBSON(str(e)).
-                     */
-                    Py_DECREF(etype);
-                    etype = InvalidBSON;
-
-                    if (evalue) {
-                        PyObject *msg = PyObject_Str(evalue);
-                        Py_DECREF(evalue);
-                        evalue = msg;
-                    }
-                    PyErr_NormalizeException(&etype, &evalue, &etrace);
-                } else {
-                    /*
-                     * The current exception matches InvalidBSON, so we don't
-                     * need this reference after all.
-                     */
-                    Py_DECREF(InvalidBSON);
-                }
-            }
-        }
-        /* Steals references to args. */
-        PyErr_Restore(etype, evalue, etrace);
+        _rewrap_as_invalid_bson();
     } else {
         PyObject *InvalidBSON = _error("InvalidBSON");
         if (InvalidBSON) {
@@ -2351,6 +2800,7 @@ static PyObject* get_value(PyObject* self, PyObject* name, const char* buffer,
 static int _element_to_dict(PyObject* self, const char* string,
                             unsigned position, unsigned max,
                             const codec_options_t* options,
+                            int raw_array,
                             PyObject** name, PyObject** value) {
     unsigned char type = (unsigned char)string[position++];
     size_t name_length = strlen(string + position);
@@ -2368,30 +2818,12 @@ static int _element_to_dict(PyObject* self, const char* string,
     if (!*name) {
         /* If NULL is returned then wrap the UnicodeDecodeError
            in an InvalidBSON error */
-        PyObject *etype, *evalue, *etrace;
-        PyObject *InvalidBSON;
-
-        PyErr_Fetch(&etype, &evalue, &etrace);
-        if (PyErr_GivenExceptionMatches(etype, PyExc_Exception)) {
-            InvalidBSON = _error("InvalidBSON");
-            if (InvalidBSON) {
-                Py_DECREF(etype);
-                etype = InvalidBSON;
-
-                if (evalue) {
-                    PyObject *msg = PyObject_Str(evalue);
-                    Py_DECREF(evalue);
-                    evalue = msg;
-                }
-                PyErr_NormalizeException(&etype, &evalue, &etrace);
-            }
-        }
-        PyErr_Restore(etype, evalue, etrace);
+        _rewrap_as_invalid_bson();
         return -1;
     }
     position += (unsigned)name_length + 1;
     *value = get_value(self, *name, string, &position, type,
-                       max - position, options);
+                       max - position, options, raw_array);
     if (!*value) {
         Py_DECREF(*name);
         return -1;
@@ -2403,22 +2835,20 @@ static PyObject* _cbson_element_to_dict(PyObject* self, PyObject* args) {
     /* TODO: Support buffer protocol */
     char* string;
     PyObject* bson;
+    PyObject* options_obj = NULL;
     codec_options_t options;
     unsigned position;
     unsigned max;
     int new_position;
+    int raw_array = 0;
     PyObject* name;
     PyObject* value;
     PyObject* result_tuple;
 
-    if (!PyArg_ParseTuple(args, "OII|O&", &bson, &position, &max,
-                          convert_codec_options, &options)) {
+    if (!(PyArg_ParseTuple(args, "OIIOp", &bson, &position, &max,
+                          &options_obj, &raw_array) &&
+            convert_codec_options(self, options_obj, &options))) {
         return NULL;
-    }
-    if (PyTuple_GET_SIZE(args) < 4) {
-        if (!default_codec_options(GETSTATE(self), &options)) {
-            return NULL;
-        }
     }
 
     if (!PyBytes_Check(bson)) {
@@ -2427,8 +2857,7 @@ static PyObject* _cbson_element_to_dict(PyObject* self, PyObject* args) {
     }
     string = PyBytes_AS_STRING(bson);
 
-    new_position = _element_to_dict(self, string, position, max, &options,
-                                    &name, &value);
+    new_position = _element_to_dict(self, string, position, max, &options, raw_array, &name, &value);
     if (new_position < 0) {
         return NULL;
     }
@@ -2448,17 +2877,27 @@ static PyObject* _elements_to_dict(PyObject* self, const char* string,
                                    unsigned max,
                                    const codec_options_t* options) {
     unsigned position = 0;
-    PyObject* dict = PyObject_CallObject(options->document_class, NULL);
+    PyObject* dict;
+    int raw_array = 0;
+
+    /* Use PyDict_New() directly when document_class is dict.
+     * This avoids the overhead of PyObject_CallObject() for the common case. */
+    if (options->is_dict_class) {
+        dict = PyDict_New();
+    } else {
+        dict = PyObject_CallObject(options->document_class, NULL);
+    }
     if (!dict) {
         return NULL;
     }
+
     while (position < max) {
         PyObject* name = NULL;
         PyObject* value = NULL;
         int new_position;
 
         new_position = _element_to_dict(
-            self, string, position, max, options, &name, &value);
+            self, string, position, max, options, raw_array, &name, &value);
         if (new_position < 0) {
             Py_DECREF(dict);
             return NULL;
@@ -2466,7 +2905,24 @@ static PyObject* _elements_to_dict(PyObject* self, const char* string,
             position = (unsigned)new_position;
         }
 
-        PyObject_SetItem(dict, name, value);
+        /* Use PyDict_SetItem() when document_class is dict.
+         * PyDict_SetItem() is faster than PyObject_SetItem() because it
+         * avoids method lookup overhead. */
+        if (options->is_dict_class) {
+            if (PyDict_SetItem(dict, name, value) < 0) {
+                Py_DECREF(name);
+                Py_DECREF(value);
+                Py_DECREF(dict);
+                return NULL;
+            }
+        } else {
+            if (PyObject_SetItem(dict, name, value) < 0) {
+                Py_DECREF(name);
+                Py_DECREF(value);
+                Py_DECREF(dict);
+                return NULL;
+            }
+        }
         Py_DECREF(name);
         Py_DECREF(value);
     }
@@ -2477,9 +2933,19 @@ static PyObject* elements_to_dict(PyObject* self, const char* string,
                                   unsigned max,
                                   const codec_options_t* options) {
     PyObject* result;
+    if (options->is_raw_bson) {
+        PyObject* bson_bytes = PyBytes_FromStringAndSize(string, max);
+        if (!bson_bytes) {
+            return NULL;
+        }
+        PyObject* raw_args[2] = {bson_bytes, options->options_obj};
+        result = PyObject_Vectorcall(options->document_class, raw_args, 2, NULL);
+        Py_DECREF(bson_bytes);
+        return result;
+    }
     if (Py_EnterRecursiveCall(" while decoding a BSON document"))
         return NULL;
-    result = _elements_to_dict(self, string, max, options);
+    result = _elements_to_dict(self, string + 4, max - 5, options);
     Py_LeaveRecursiveCall();
     return result;
 }
@@ -2512,14 +2978,14 @@ static PyObject* _cbson_bson_to_dict(PyObject* self, PyObject* args) {
     int32_t size;
     Py_ssize_t total_size;
     const char* string;
-    PyObject* bson;
+    PyObject* bson = NULL;
     codec_options_t options;
     PyObject* result = NULL;
     PyObject* options_obj;
     Py_buffer view = {0};
 
     if (! (PyArg_ParseTuple(args, "OO", &bson, &options_obj) &&
-            convert_codec_options(options_obj, &options))) {
+            convert_codec_options(self, options_obj, &options))) {
         return result;
     }
 
@@ -2541,7 +3007,6 @@ static PyObject* _cbson_bson_to_dict(PyObject* self, PyObject* args) {
     }
 
     string = (char*)view.buf;
-
     memcpy(&size, string, 4);
     size = (int32_t)BSON_UINT32_FROM_LE(size);
     if (size < BSON_MIN_SIZE) {
@@ -2571,15 +3036,7 @@ static PyObject* _cbson_bson_to_dict(PyObject* self, PyObject* args) {
         goto done;
     }
 
-    /* No need to decode fields if using RawBSONDocument */
-    if (options.is_raw_bson) {
-        result = PyObject_CallFunction(
-            options.document_class, "y#O", string, (Py_ssize_t)size,
-            options_obj);
-    }
-    else {
-        result = elements_to_dict(self, string + 4, (unsigned)size - 5, &options);
-    }
+    result = elements_to_dict(self, string, (unsigned)size, &options);
 done:
     PyBuffer_Release(&view);
     destroy_codec_options(&options);
@@ -2594,17 +3051,11 @@ static PyObject* _cbson_decode_all(PyObject* self, PyObject* args) {
     PyObject* dict;
     PyObject* result = NULL;
     codec_options_t options;
-    PyObject* options_obj;
+    PyObject* options_obj = NULL;
     Py_buffer view = {0};
 
-    if (!PyArg_ParseTuple(args, "O|O", &bson, &options_obj)) {
-        return NULL;
-    }
-    if (PyTuple_GET_SIZE(args) < 2) {
-        if (!default_codec_options(GETSTATE(self), &options)) {
-            return NULL;
-        }
-    } else if (!convert_codec_options(options_obj, &options)) {
+    if (!(PyArg_ParseTuple(args, "OO", &bson, &options_obj) &&
+            convert_codec_options(self, options_obj, &options))) {
         return NULL;
     }
 
@@ -2663,14 +3114,7 @@ static PyObject* _cbson_decode_all(PyObject* self, PyObject* args) {
             goto fail;
         }
 
-        /* No need to decode fields if using RawBSONDocument. */
-        if (options.is_raw_bson) {
-            dict = PyObject_CallFunction(
-                options.document_class, "y#O", string, (Py_ssize_t)size,
-                options_obj);
-        } else {
-            dict = elements_to_dict(self, string + 4, (unsigned)size - 5, &options);
-        }
+        dict = elements_to_dict(self, string, (unsigned)size, &options);
         if (!dict) {
             Py_DECREF(result);
             goto fail;
@@ -2693,65 +3137,253 @@ done:
     return result;
 }
 
+
+static PyObject* _cbson_array_of_documents_to_buffer(PyObject* self, PyObject* args) {
+    uint32_t size;
+    uint32_t value_length;
+    uint32_t position = 0;
+    buffer_t buffer;
+    const char* string;
+    PyObject* arr;
+    PyObject* result = NULL;
+    Py_buffer view = {0};
+
+    if (!PyArg_ParseTuple(args, "O", &arr)) {
+        return NULL;
+    }
+
+    if (!_get_buffer(arr, &view)) {
+        return NULL;
+    }
+
+    buffer = pymongo_buffer_new();
+    if (!buffer) {
+        PyBuffer_Release(&view);
+        return NULL;
+    }
+
+    string = (char*)view.buf;
+
+    if (view.len < BSON_MIN_SIZE) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON,
+                            "not enough data for a BSON document");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
+    }
+
+    memcpy(&size, string, 4);
+    size = BSON_UINT32_FROM_LE(size);
+
+    /* validate the size of the array */
+    if (view.len != (int32_t)size || (int32_t)size < BSON_MIN_SIZE) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON, "objsize too large");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
+    }
+
+    if (string[size - 1]) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON, "bad eoo");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
+    }
+
+    /* save space for length */
+    if (pymongo_buffer_save_space(buffer, size) == -1) {
+        goto fail;
+    }
+    pymongo_buffer_update_position(buffer, 0);
+
+    position += 4;
+    while (position < size - 1) {
+        // Verify the value is an object.
+        unsigned char type = (unsigned char)string[position];
+        if (type != 3) {
+            PyObject* InvalidBSON = _error("InvalidBSON");
+            if (InvalidBSON) {
+                PyErr_SetString(InvalidBSON, "array element was not an object");
+                Py_DECREF(InvalidBSON);
+            }
+            goto fail;
+        }
+
+        // Just skip the keys.
+        position = position + strlen(string + position) + 1;
+
+        if (position >= size || (size - position) < BSON_MIN_SIZE) {
+            PyObject* InvalidBSON = _error("InvalidBSON");
+            if (InvalidBSON) {
+                PyErr_SetString(InvalidBSON, "invalid array content");
+                Py_DECREF(InvalidBSON);
+            }
+            goto fail;
+         }
+
+        memcpy(&value_length, string + position, 4);
+        value_length = BSON_UINT32_FROM_LE(value_length);
+        if (value_length < BSON_MIN_SIZE) {
+            PyObject* InvalidBSON = _error("InvalidBSON");
+            if (InvalidBSON) {
+                PyErr_SetString(InvalidBSON, "invalid message size");
+                Py_DECREF(InvalidBSON);
+            }
+            goto fail;
+         }
+
+        if (pymongo_buffer_write(buffer, string + position, value_length) == 1) {
+            goto fail;
+        }
+        position += value_length;
+    }
+
+    if (position != size - 1) {
+        PyObject* InvalidBSON = _error("InvalidBSON");
+        if (InvalidBSON) {
+            PyErr_SetString(InvalidBSON,
+                            "bad object or element length");
+            Py_DECREF(InvalidBSON);
+        }
+        goto fail;
+    }
+
+    /* objectify buffer */
+    result = Py_BuildValue("y#", pymongo_buffer_get_buffer(buffer),
+                           (Py_ssize_t)pymongo_buffer_get_position(buffer));
+    goto done;
+fail:
+    result = NULL;
+done:
+    PyBuffer_Release(&view);
+    pymongo_buffer_free(buffer);
+    return result;
+}
+
+
 static PyMethodDef _CBSONMethods[] = {
     {"_dict_to_bson", _cbson_dict_to_bson, METH_VARARGS,
      "convert a dictionary to a string containing its BSON representation."},
     {"_bson_to_dict", _cbson_bson_to_dict, METH_VARARGS,
      "convert a BSON string to a SON object."},
-    {"decode_all", _cbson_decode_all, METH_VARARGS,
+    {"_decode_all", _cbson_decode_all, METH_VARARGS,
      "convert binary data to a sequence of documents."},
     {"_element_to_dict", _cbson_element_to_dict, METH_VARARGS,
      "Decode a single key, value pair."},
+    {"_array_of_documents_to_buffer", _cbson_array_of_documents_to_buffer, METH_VARARGS, "Convert raw array of documents to a stream of BSON documents"},
+    {"_test_long_long_to_str", _test_long_long_to_str, METH_VARARGS, "Test conversion of extreme and common Py_ssize_t values to str."},
     {NULL, NULL, 0, NULL}
 };
 
-#define INITERROR return NULL
+#define INITERROR return -1;
 static int _cbson_traverse(PyObject *m, visitproc visit, void *arg) {
-    Py_VISIT(GETSTATE(m)->Binary);
-    Py_VISIT(GETSTATE(m)->Code);
-    Py_VISIT(GETSTATE(m)->ObjectId);
-    Py_VISIT(GETSTATE(m)->DBRef);
-    Py_VISIT(GETSTATE(m)->Regex);
-    Py_VISIT(GETSTATE(m)->UUID);
-    Py_VISIT(GETSTATE(m)->Timestamp);
-    Py_VISIT(GETSTATE(m)->MinKey);
-    Py_VISIT(GETSTATE(m)->MaxKey);
-    Py_VISIT(GETSTATE(m)->UTC);
-    Py_VISIT(GETSTATE(m)->REType);
+    struct module_state *state = GETSTATE(m);
+    if (!state) {
+        return 0;
+    }
+    Py_VISIT(state->Binary);
+    Py_VISIT(state->Code);
+    Py_VISIT(state->ObjectId);
+    Py_VISIT(state->DBRef);
+    Py_VISIT(state->Regex);
+    Py_VISIT(state->UUID);
+    Py_VISIT(state->Timestamp);
+    Py_VISIT(state->MinKey);
+    Py_VISIT(state->MaxKey);
+    Py_VISIT(state->UTC);
+    Py_VISIT(state->REType);
+    Py_VISIT(state->_type_marker_str);
+    Py_VISIT(state->_flags_str);
+    Py_VISIT(state->_pattern_str);
+    Py_VISIT(state->_encoder_map_str);
+    Py_VISIT(state->_decoder_map_str);
+    Py_VISIT(state->_fallback_encoder_str);
+    Py_VISIT(state->_raw_str);
+    Py_VISIT(state->_subtype_str);
+    Py_VISIT(state->_binary_str);
+    Py_VISIT(state->_scope_str);
+    Py_VISIT(state->_inc_str);
+    Py_VISIT(state->_time_str);
+    Py_VISIT(state->_bid_str);
+    Py_VISIT(state->_replace_str);
+    Py_VISIT(state->_astimezone_str);
+    Py_VISIT(state->_id_str);
+    Py_VISIT(state->_dollar_ref_str);
+    Py_VISIT(state->_dollar_id_str);
+    Py_VISIT(state->_dollar_db_str);
+    Py_VISIT(state->_tzinfo_str);
+    Py_VISIT(state->_as_doc_str);
+    Py_VISIT(state->_utcoffset_str);
+    Py_VISIT(state->_from_uuid_str);
+    Py_VISIT(state->_as_uuid_str);
+    Py_VISIT(state->_from_bid_str);
+    Py_VISIT(state->min_datetime);
+    Py_VISIT(state->max_datetime);
+    Py_VISIT(state->replace_args);
+    Py_VISIT(state->replace_kwargs);
     return 0;
 }
 
 static int _cbson_clear(PyObject *m) {
-    Py_CLEAR(GETSTATE(m)->Binary);
-    Py_CLEAR(GETSTATE(m)->Code);
-    Py_CLEAR(GETSTATE(m)->ObjectId);
-    Py_CLEAR(GETSTATE(m)->DBRef);
-    Py_CLEAR(GETSTATE(m)->Regex);
-    Py_CLEAR(GETSTATE(m)->UUID);
-    Py_CLEAR(GETSTATE(m)->Timestamp);
-    Py_CLEAR(GETSTATE(m)->MinKey);
-    Py_CLEAR(GETSTATE(m)->MaxKey);
-    Py_CLEAR(GETSTATE(m)->UTC);
-    Py_CLEAR(GETSTATE(m)->REType);
+    struct module_state *state = GETSTATE(m);
+    if (!state) {
+        return 0;
+    }
+    Py_CLEAR(state->Binary);
+    Py_CLEAR(state->Code);
+    Py_CLEAR(state->ObjectId);
+    Py_CLEAR(state->DBRef);
+    Py_CLEAR(state->Regex);
+    Py_CLEAR(state->UUID);
+    Py_CLEAR(state->Timestamp);
+    Py_CLEAR(state->MinKey);
+    Py_CLEAR(state->MaxKey);
+    Py_CLEAR(state->UTC);
+    Py_CLEAR(state->REType);
+    Py_CLEAR(state->_type_marker_str);
+    Py_CLEAR(state->_flags_str);
+    Py_CLEAR(state->_pattern_str);
+    Py_CLEAR(state->_encoder_map_str);
+    Py_CLEAR(state->_decoder_map_str);
+    Py_CLEAR(state->_fallback_encoder_str);
+    Py_CLEAR(state->_raw_str);
+    Py_CLEAR(state->_subtype_str);
+    Py_CLEAR(state->_binary_str);
+    Py_CLEAR(state->_scope_str);
+    Py_CLEAR(state->_inc_str);
+    Py_CLEAR(state->_time_str);
+    Py_CLEAR(state->_bid_str);
+    Py_CLEAR(state->_replace_str);
+    Py_CLEAR(state->_astimezone_str);
+    Py_CLEAR(state->_id_str);
+    Py_CLEAR(state->_dollar_ref_str);
+    Py_CLEAR(state->_dollar_id_str);
+    Py_CLEAR(state->_dollar_db_str);
+    Py_CLEAR(state->_tzinfo_str);
+    Py_CLEAR(state->_as_doc_str);
+    Py_CLEAR(state->_utcoffset_str);
+    Py_CLEAR(state->_from_uuid_str);
+    Py_CLEAR(state->_as_uuid_str);
+    Py_CLEAR(state->_from_bid_str);
+    Py_CLEAR(state->min_datetime);
+    Py_CLEAR(state->max_datetime);
+    Py_CLEAR(state->replace_args);
+    Py_CLEAR(state->replace_kwargs);
     return 0;
 }
 
-static struct PyModuleDef moduledef = {
-    PyModuleDef_HEAD_INIT,
-    "_cbson",
-    NULL,
-    sizeof(struct module_state),
-    _CBSONMethods,
-    NULL,
-    _cbson_traverse,
-    _cbson_clear,
-    NULL
-};
-
-PyMODINIT_FUNC
-PyInit__cbson(void)
+/* Multi-phase extension module initialization code.
+ * See https://peps.python.org/pep-0489/.
+*/
+static int
+_cbson_exec(PyObject *m)
 {
-    PyObject *m;
     PyObject *c_api_object;
     static void *_cbson_API[_cbson_API_POINTER_COUNT];
 
@@ -2774,16 +3406,9 @@ PyInit__cbson(void)
         (void *) buffer_write_int32_at_position;
     _cbson_API[_cbson_downcast_and_check_INDEX] = (void *) _downcast_and_check;
 
-    /* PyCapsule is new in python 3.1 */
     c_api_object = PyCapsule_New((void *) _cbson_API, "_cbson._C_API", NULL);
     if (c_api_object == NULL)
         INITERROR;
-
-    m = PyModule_Create(&moduledef);
-    if (m == NULL) {
-        Py_DECREF(c_api_object);
-        INITERROR;
-    }
 
     /* Import several python objects */
     if (_load_python_objects(m)) {
@@ -2792,11 +3417,48 @@ PyInit__cbson(void)
         INITERROR;
     }
 
+#if PY_VERSION_HEX >= 0x030D0000
+    if (PyModule_Add(m, "_C_API", c_api_object) < 0) {
+        Py_DECREF(m);
+        INITERROR;
+    }
+# else
     if (PyModule_AddObject(m, "_C_API", c_api_object) < 0) {
         Py_DECREF(c_api_object);
         Py_DECREF(m);
         INITERROR;
     }
+#endif
 
-    return m;
+    return 0;
+}
+
+static PyModuleDef_Slot _cbson_slots[] = {
+    {Py_mod_exec, _cbson_exec},
+#if defined(Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED)
+    {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_SUPPORTED},
+#endif
+#if PY_VERSION_HEX >= 0x030D0000
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
+#endif
+    {0, NULL},
+};
+
+
+static struct PyModuleDef moduledef = {
+    PyModuleDef_HEAD_INIT,
+    "_cbson",
+    NULL,
+    sizeof(struct module_state),
+    _CBSONMethods,
+    _cbson_slots,
+    _cbson_traverse,
+    _cbson_clear,
+    NULL
+};
+
+PyMODINIT_FUNC
+PyInit__cbson(void)
+{
+    return PyModuleDef_Init(&moduledef);
 }

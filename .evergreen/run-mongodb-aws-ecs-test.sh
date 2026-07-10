@@ -1,7 +1,6 @@
 #!/bin/bash
-
-# Don't trace since the URI contains a password that shouldn't show up in the logs
-set -o errexit  # Exit the script with error if any of the commands fail
+# Script run on an ECS host to test MONGODB-AWS.
+set -eu
 
 ############################################
 #            Main Program                  #
@@ -20,28 +19,14 @@ fi
 # Now we can safely enable xtrace
 set -o xtrace
 
-if command -v virtualenv ; then
-    VIRTUALENV=$(command -v virtualenv)
-else
-    echo "Installing virtualenv..."
-    apt install python3-pip -y
-    pip3 install --user virtualenv
-    VIRTUALENV='python3 -m virtualenv'
-fi
+# Install a c compiler.
+apt-get -qq update  < /dev/null > /dev/null
+apt-get -q install -y build-essential
 
-authtest () {
-    echo "Running MONGODB-AWS ECS authentication tests with $PYTHON"
-    $PYTHON --version
-
-    $VIRTUALENV -p $PYTHON --never-download venvaws
-    . venvaws/bin/activate
-
-    cd src
-    python -m pip install '.[aws]'
-    python test/auth_aws/test_auth_aws.py
-    cd -
-    deactivate
-    rm -rf venvaws
-}
-
-PYTHON=$(command -v python3) authtest
+export SET_XTRACE_ON=1
+cd src
+rm -rf .venv
+rm -f .evergreen/scripts/test-env.sh || true
+rm -f .evergreen/scripts/env.sh || true
+bash ./.evergreen/just.sh setup-tests auth_aws ecs-remote
+bash .evergreen/just.sh run-tests

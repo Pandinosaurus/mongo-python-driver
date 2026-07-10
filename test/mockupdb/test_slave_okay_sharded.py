@@ -18,21 +18,29 @@
 - A direct connection to a slave.
 - A direct connection to a mongos.
 """
-import itertools
 
-from pymongo.read_preferences import make_read_preference
-from pymongo.read_preferences import read_pref_mode_from_name
+from __future__ import annotations
+
+import itertools
+import unittest
+from queue import Queue
+
+import pytest
 
 try:
-    from queue import Queue
+    from mockupdb import MockupDB, going
+
+    _HAVE_MOCKUPDB = True
 except ImportError:
-    from Queue import Queue
+    _HAVE_MOCKUPDB = False
 
-from mockupdb import MockupDB, going
+from operations import operations  # type: ignore[import]
+
 from pymongo import MongoClient
+from pymongo.common import MIN_SUPPORTED_WIRE_VERSION
+from pymongo.read_preferences import make_read_preference, read_pref_mode_from_name
 
-import unittest
-from operations import operations
+pytestmark = pytest.mark.mockupdb
 
 
 class TestSlaveOkaySharded(unittest.TestCase):
@@ -40,32 +48,35 @@ class TestSlaveOkaySharded(unittest.TestCase):
         self.mongos1, self.mongos2 = MockupDB(), MockupDB()
 
         # Collect queries to either server in one queue.
-        self.q = Queue()
+        self.q: Queue = Queue()
         for server in self.mongos1, self.mongos2:
             server.subscribe(self.q.put)
             server.run()
             self.addCleanup(server.stop)
-            server.autoresponds('ismaster', minWireVersion=2, maxWireVersion=6,
-                                ismaster=True, msg='isdbgrid')
+            server.autoresponds(
+                "ismaster",
+                minWireVersion=2,
+                maxWireVersion=MIN_SUPPORTED_WIRE_VERSION,
+                ismaster=True,
+                msg="isdbgrid",
+            )
 
-        self.mongoses_uri = 'mongodb://%s,%s' % (self.mongos1.address_string,
-                                                 self.mongos2.address_string)
+        self.mongoses_uri = f"mongodb://{self.mongos1.address_string},{self.mongos2.address_string}"
 
 
 def create_slave_ok_sharded_test(mode, operation):
     def test(self):
         self.setup_server()
-        if operation.op_type == 'always-use-secondary':
+        if operation.op_type == "always-use-secondary":
             slave_ok = True
-        elif operation.op_type == 'may-use-secondary':
-            slave_ok = mode != 'primary'
-        elif operation.op_type == 'must-use-primary':
+        elif operation.op_type == "may-use-secondary":
+            slave_ok = mode != "primary"
+        elif operation.op_type == "must-use-primary":
             slave_ok = False
         else:
-            assert False, 'unrecognized op_type %r' % operation.op_type
+            raise AssertionError("unrecognized op_type %r" % operation.op_type)
 
-        pref = make_read_preference(read_pref_mode_from_name(mode),
-                                    tag_sets=None)
+        pref = make_read_preference(read_pref_mode_from_name(mode), tag_sets=None)
 
         client = MongoClient(self.mongoses_uri, read_preference=pref)
         self.addCleanup(client.close)
@@ -74,22 +85,21 @@ def create_slave_ok_sharded_test(mode, operation):
             request.reply(operation.reply)
 
         if slave_ok:
-            self.assertTrue(request.slave_ok, 'SlaveOkay not set')
+            self.assertTrue(request.slave_ok, "SlaveOkay not set")
         else:
-            self.assertFalse(request.slave_ok, 'SlaveOkay set')
+            self.assertFalse(request.slave_ok, "SlaveOkay set")
 
     return test
 
 
 def generate_slave_ok_sharded_tests():
-    modes = 'primary', 'secondary', 'nearest'
+    modes = "primary", "secondary", "nearest"
     matrix = itertools.product(modes, operations)
 
     for entry in matrix:
         mode, operation = entry
         test = create_slave_ok_sharded_test(mode, operation)
-        test_name = 'test_%s_with_mode_%s' % (
-            operation.name.replace(' ', '_'), mode)
+        test_name = "test_{}_with_mode_{}".format(operation.name.replace(" ", "_"), mode)
 
         test.__name__ = test_name
         setattr(TestSlaveOkaySharded, test_name, test)
@@ -97,5 +107,5 @@ def generate_slave_ok_sharded_tests():
 
 generate_slave_ok_sharded_tests()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

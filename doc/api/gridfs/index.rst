@@ -3,12 +3,13 @@
 
 .. automodule:: gridfs
    :synopsis: Tools for working with GridFS
-   :members:
+   :members: GridFS, GridFSBucket
 
 Sub-modules:
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 3
 
+   asynchronous/index
    errors
    grid_file

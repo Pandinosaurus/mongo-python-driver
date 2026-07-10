@@ -12,70 +12,80 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Test client for mod_wsgi application, see bug PYTHON-353.
-"""
+"""Test client for mod_wsgi application, see bug PYTHON-353."""
 
+from __future__ import annotations
+
+import _thread as thread
+import random
 import sys
 import threading
 import time
-
 from optparse import OptionParser
-
-try:
-    from urllib2 import urlopen
-except ImportError:
-    # Python 3.
-    from urllib.request import urlopen
+from urllib.request import urlopen
 
 
-try:
-    import thread
-except ImportError:
-    # Python 3.
-    import _thread as thread
+def parse_args(args=None):
+    parser = OptionParser(
+        """usage: %prog [options] mode url [<url2>...]
 
-
-def parse_args():
-    parser = OptionParser("""usage: %prog [options] mode url
-
-  mode:\tparallel or serial""")
+  mode:\tparallel or serial"""
+    )
 
     # Should be enough that any connection leak will exhaust available file
     # descriptors.
     parser.add_option(
-        "-n", "--nrequests", type="int",
-        dest="nrequests", default=50 * 1000,
-        help="Number of times to GET the URL, in total")
+        "-n",
+        "--nrequests",
+        type="int",
+        dest="nrequests",
+        default=50 * 1000,
+        help="Number of times to GET the URLs, in total",
+    )
 
     parser.add_option(
-        "-t", "--nthreads", type="int",
-        dest="nthreads", default=100,
-        help="Number of threads with mode 'parallel'")
+        "-t",
+        "--nthreads",
+        type="int",
+        dest="nthreads",
+        default=100,
+        help="Number of threads with mode 'parallel'",
+    )
 
     parser.add_option(
-        "-q", "--quiet",
-        action="store_false", dest="verbose", default=True,
-        help="Don't print status messages to stdout")
+        "-q",
+        "--quiet",
+        action="store_false",
+        dest="verbose",
+        default=True,
+        help="Don't print status messages to stdout",
+    )
 
     parser.add_option(
-        "-c", "--continue",
-        action="store_true", dest="continue_", default=False,
-        help="Continue after HTTP errors")
+        "-c",
+        "--continue",
+        action="store_true",
+        dest="continue_",
+        default=False,
+        help="Continue after HTTP errors",
+    )
 
     try:
-        options, (mode, url) = parser.parse_args()
-    except ValueError:
+        options, args = parser.parse_args(args or sys.argv[1:])
+        mode, urls = args[0], args[1:]
+    except (ValueError, IndexError):
         parser.print_usage()
         sys.exit(1)
 
-    if mode not in ('parallel', 'serial'):
+    if mode not in ("parallel", "serial"):
         parser.print_usage()
         sys.exit(1)
 
-    return options, mode, url
+    return options, mode, urls
 
 
-def get(url):
+def get(urls):
+    url = random.choice(urls)
     urlopen(url).read().strip()
 
 
@@ -84,21 +94,21 @@ class URLGetterThread(threading.Thread):
     counter_lock = threading.Lock()
     counter = 0
 
-    def __init__(self, options, url, nrequests_per_thread):
-        super(URLGetterThread, self).__init__()
+    def __init__(self, options, urls, nrequests_per_thread):
+        super().__init__()
         self.options = options
-        self.url = url
+        self.urls = urls
         self.nrequests_per_thread = nrequests_per_thread
         self.errors = 0
 
     def run(self):
-        for i in range(self.nrequests_per_thread):
+        for _i in range(self.nrequests_per_thread):
             try:
-                get(url)
+                get(self.urls)
             except Exception as e:
                 print(e)
 
-                if not options.continue_:
+                if not self.options.continue_:
                     thread.interrupt_main()
                     thread.exit()
 
@@ -108,27 +118,25 @@ class URLGetterThread(threading.Thread):
                 URLGetterThread.counter += 1
                 counter = URLGetterThread.counter
 
-            should_print = options.verbose and not counter % 1000
+            should_print = self.options.verbose and not counter % 1000
 
             if should_print:
                 print(counter)
 
 
-def main(options, mode, url):
+def main(options, mode, urls):
     start_time = time.time()
     errors = 0
-    if mode == 'parallel':
+    if mode == "parallel":
         nrequests_per_thread = options.nrequests // options.nthreads
 
         if options.verbose:
-            print (
-                'Getting %s %s times total in %s threads, '
-                '%s times per thread' % (
-                    url, nrequests_per_thread * options.nthreads,
-                    options.nthreads, nrequests_per_thread))
+            print(
+                f"Getting {urls} {nrequests_per_thread * options.nthreads} times total in {options.nthreads} threads, "
+                f"{nrequests_per_thread} times per thread"
+            )
         threads = [
-            URLGetterThread(options, url, nrequests_per_thread)
-            for _ in range(options.nthreads)
+            URLGetterThread(options, urls, nrequests_per_thread) for _ in range(options.nthreads)
         ]
 
         for t in threads:
@@ -140,18 +148,15 @@ def main(options, mode, url):
         errors = sum([t.errors for t in threads])
         nthreads_with_errors = len([t for t in threads if t.errors])
         if nthreads_with_errors:
-            print('%d threads had errors! %d errors in total' % (
-                nthreads_with_errors, errors))
+            print("%d threads had errors! %d errors in total" % (nthreads_with_errors, errors))
     else:
-        assert mode == 'serial'
+        assert mode == "serial"
         if options.verbose:
-            print('Getting %s %s times in one thread' % (
-                url, options.nrequests
-            ))
+            print(f"Getting {urls} {options.nrequests} times in one thread")
 
         for i in range(1, options.nrequests + 1):
             try:
-                get(url)
+                get(urls)
             except Exception as e:
                 print(e)
                 if not options.continue_:
@@ -163,16 +168,16 @@ def main(options, mode, url):
                 print(i)
 
         if errors:
-            print('%d errors!' % errors)
+            print("%d errors!" % errors)
 
     if options.verbose:
-        print('Completed in %.2f seconds' % (time.time() - start_time))
+        print("Completed in %.2f seconds" % (time.time() - start_time))
 
     if errors:
         # Failure
         sys.exit(1)
 
 
-if __name__ == '__main__':
-    options, mode, url = parse_args()
-    main(options, mode, url)
+if __name__ == "__main__":
+    options, mode, urls = parse_args()
+    main(options, mode, urls)

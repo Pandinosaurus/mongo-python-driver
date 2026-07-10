@@ -11,64 +11,82 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
+from typing import Any
 
 sys.path[0:0] = [""]
 
 from bson import ObjectId
+from test import UnitTest, unittest
+from test.unified_format import (
+    MatchEvaluatorUtil,
+    generate_test_classes,
+    get_test_path,
+)
 
-from test import unittest
-from test.unified_format import generate_test_classes, MatchEvaluatorUtil
+_IS_SYNC = True
 
+# Location of JSON test specifications.
+TEST_PATH = get_test_path("unified-test-format")
 
-_TEST_PATH = os.path.join(
-    os.path.dirname(os.path.realpath(__file__)), 'unified-test-format')
-
-
-globals().update(generate_test_classes(
-    os.path.join(_TEST_PATH, 'valid-pass'),
-    module=__name__,
-    class_name_prefix='UnifiedTestFormat',
-    expected_failures=[
-        'Client side error in command starting transaction',    # PYTHON-1894
-    ],
-    RUN_ON_SERVERLESS=False))
-
-
-globals().update(generate_test_classes(
-    os.path.join(_TEST_PATH, 'valid-fail'),
-    module=__name__,
-    class_name_prefix='UnifiedTestFormat',
-    bypass_test_generation_errors=True,
-    expected_failures=[
-        '.*',       # All tests expected to fail
-    ],
-    RUN_ON_SERVERLESS=False))
+globals().update(
+    generate_test_classes(
+        os.path.join(TEST_PATH, "valid-pass"),
+        module=__name__,
+        class_name_prefix="UnifiedTestFormat",
+    )
+)
 
 
-class TestMatchEvaluatorUtil(unittest.TestCase):
+globals().update(
+    generate_test_classes(
+        os.path.join(TEST_PATH, "valid-fail"),
+        module=__name__,
+        class_name_prefix="UnifiedTestFormat",
+        bypass_test_generation_errors=True,
+        expected_failures=[
+            ".*",  # All tests expected to fail
+        ],
+    )
+)
+
+
+class TestMatchEvaluatorUtil(UnitTest):
     def setUp(self):
         self.match_evaluator = MatchEvaluatorUtil(self)
 
     def test_unsetOrMatches(self):
-        spec = {'$$unsetOrMatches': {'y': {'$$unsetOrMatches': 2}}}
-        for actual in [{}, {'y': 2}, None]:
+        spec: dict[str, Any] = {"$$unsetOrMatches": {"y": {"$$unsetOrMatches": 2}}}
+        for actual in [{}, {"y": 2}, None]:
             self.match_evaluator.match_result(spec, actual)
 
-        spec = {'x': {'$$unsetOrMatches': {'y': {'$$unsetOrMatches': 2}}}}
-        for actual in [{}, {'x': {}}, {'x': {'y': 2}}]:
+        spec = {"x": {"$$unsetOrMatches": {"y": {"$$unsetOrMatches": 2}}}}
+        for actual in [{}, {"x": {}}, {"x": {"y": 2}}]:
             self.match_evaluator.match_result(spec, actual)
+
+        spec = {"y": {"$$unsetOrMatches": {"$$exists": True}}}
+        self.match_evaluator.match_result(spec, {})
+        self.match_evaluator.match_result(spec, {"y": 2})
+        self.match_evaluator.match_result(spec, {"x": 1})
+        self.match_evaluator.match_result(spec, {"y": {}})
 
     def test_type(self):
         self.match_evaluator.match_result(
-            {'operationType': 'insert',
-             'ns': {'db': 'change-stream-tests', 'coll': 'test'},
-             'fullDocument': {'_id': {'$$type': 'objectId'}, 'x': 1}},
-            {'operationType': 'insert',
-             'fullDocument': {'_id': ObjectId('5fc93511ac93941052098f0c'), 'x': 1},
-             'ns': {'db': 'change-stream-tests', 'coll': 'test'}})
+            {
+                "operationType": "insert",
+                "ns": {"db": "change-stream-tests", "coll": "test"},
+                "fullDocument": {"_id": {"$$type": "objectId"}, "x": 1},
+            },
+            {
+                "operationType": "insert",
+                "fullDocument": {"_id": ObjectId("5fc93511ac93941052098f0c"), "x": 1},
+                "ns": {"db": "change-stream-tests", "coll": "test"},
+            },
+        )
 
 
 if __name__ == "__main__":

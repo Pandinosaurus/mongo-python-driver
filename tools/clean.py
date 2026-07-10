@@ -1,4 +1,4 @@
-# Copyright 2009-2015 MongoDB, Inc.
+# Copyright 2009-present MongoDB, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,34 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Clean up script for build artifacts.
+"""Remove built C extensions from the source tree.
 
-Only really intended to be used by internal build scripts.
+Used as cibuildwheel's before-build hook so artifacts from one Python
+version do not leak into the wheel built for the next.
 """
 
-import os
-import sys
+from __future__ import annotations
 
-try:
-    os.remove("pymongo/_cmessage.so")
-    os.remove("bson/_cbson.so")
-except:
-    pass
+from pathlib import Path
 
-try:
-    os.remove("pymongo/_cmessage.pyd")
-    os.remove("bson/_cbson.pyd")
-except:
-    pass
-
-try:
-    from pymongo import _cmessage
-    sys.exit("could still import _cmessage")
-except ImportError:
-    pass
-
-try:
-    from bson import _cbson
-    sys.exit("could still import _cbson")
-except ImportError:
-    pass
+for pkg in ("bson", "pymongo"):
+    for pattern in ("*.so", "*.pyd"):
+        for path in Path(pkg).glob(pattern):
+            path.unlink()
+            print(f"removed {path}")

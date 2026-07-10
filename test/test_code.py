@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Copyright 2009-present MongoDB, Inc.
 #
@@ -16,7 +15,10 @@
 
 """Tests for the Code wrapper."""
 
+from __future__ import annotations
+
 import sys
+
 sys.path[0:0] = [""]
 
 from bson.code import Code
@@ -35,7 +37,8 @@ class TestCode(unittest.TestCase):
         c = Code("blah")
 
         def set_c():
-            c.scope = 5
+            c.scope = 5  # type: ignore
+
         self.assertRaises(AttributeError, set_c)
 
     def test_code(self):
@@ -43,18 +46,18 @@ class TestCode(unittest.TestCase):
         a_code = Code("hello world")
         self.assertTrue(a_code.startswith("hello"))
         self.assertTrue(a_code.endswith("world"))
-        self.assertTrue(isinstance(a_code, Code))
-        self.assertFalse(isinstance(a_string, Code))
+        self.assertIsInstance(a_code, Code)
+        self.assertNotIsInstance(a_string, Code)
         self.assertIsNone(a_code.scope)
-        with_scope = Code('hello world', {'my_var': 5})
-        self.assertEqual({'my_var': 5}, with_scope.scope)
-        empty_scope = Code('hello world', {})
+        with_scope = Code("hello world", {"my_var": 5})
+        self.assertEqual({"my_var": 5}, with_scope.scope)
+        empty_scope = Code("hello world", {})
         self.assertEqual({}, empty_scope.scope)
-        another_scope = Code(with_scope, {'new_var': 42})
+        another_scope = Code(with_scope, {"new_var": 42})
         self.assertEqual(str(with_scope), str(another_scope))
-        self.assertEqual({'new_var': 42, 'my_var': 5}, another_scope.scope)
+        self.assertEqual({"new_var": 42, "my_var": 5}, another_scope.scope)
         # No error.
-        Code('héllø world¡')
+        Code("héllø world¡")
 
     def test_repr(self):
         c = Code("hello world", {})
@@ -63,8 +66,8 @@ class TestCode(unittest.TestCase):
         self.assertEqual(repr(c), "Code('hello world', {'foo': 'bar'})")
         c = Code("hello world", {"blah": 3})
         self.assertEqual(repr(c), "Code('hello world', {'blah': 3})")
-        c = Code("\x08\xFF")
-        self.assertEqual(repr(c), "Code(%s, None)" % (repr("\x08\xFF"),))
+        c = Code("\x08\xff")
+        self.assertEqual(repr(c), "Code({}, None)".format(repr("\x08\xff")))
 
     def test_equality(self):
         b = Code("hello")
@@ -97,8 +100,7 @@ class TestCode(unittest.TestCase):
     def test_scope_kwargs(self):
         self.assertEqual({"a": 1}, Code("", a=1).scope)
         self.assertEqual({"a": 1}, Code("", {"a": 2}, a=1).scope)
-        self.assertEqual({"a": 1, "b": 2, "c": 3},
-                         Code("", {"b": 2}, a=1, c=3).scope)
+        self.assertEqual({"a": 1, "b": 2, "c": 3}, Code("", {"b": 2}, a=1, c=3).scope)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
 import datetime
 import random
@@ -23,6 +24,8 @@ sys.path[0:0] = [""]
 from bson.dbref import DBRef
 from bson.objectid import ObjectId
 from bson.son import SON
+
+_IS_SYNC = True
 
 gen_target = 100
 reduction_attempts = 10
@@ -83,9 +86,7 @@ def gen_unichar():
 
 
 def gen_unicode(gen_length):
-    return lambda: "".join([x for x in
-                             gen_list(gen_unichar(), gen_length)() if
-                             x not in ".$"])
+    return lambda: "".join([x for x in gen_list(gen_unichar(), gen_length)() if x not in ".$"])
 
 
 def gen_list(generator, gen_length):
@@ -93,22 +94,24 @@ def gen_list(generator, gen_length):
 
 
 def gen_datetime():
-    return lambda: datetime.datetime(random.randint(1970, 2037),
-                                     random.randint(1, 12),
-                                     random.randint(1, 28),
-                                     random.randint(0, 23),
-                                     random.randint(0, 59),
-                                     random.randint(0, 59),
-                                     random.randint(0, 999) * 1000)
+    return lambda: datetime.datetime(
+        random.randint(1970, 2037),
+        random.randint(1, 12),
+        random.randint(1, 28),
+        random.randint(0, 23),
+        random.randint(0, 59),
+        random.randint(0, 59),
+        random.randint(0, 999) * 1000,
+    )
 
 
 def gen_dict(gen_key, gen_value, gen_length):
-
     def a_dict(gen_key, gen_value, length):
         result = {}
         for _ in range(length):
             result[gen_key()] = gen_value()
         return result
+
     return lambda: a_dict(gen_key, gen_value, gen_length())
 
 
@@ -116,7 +119,8 @@ def gen_regexp(gen_length):
     # TODO our patterns only consist of one letter.
     # this is because of a bug in CPython's regex equality testing,
     # which I haven't quite tracked down, so I'm just ignoring it...
-    pattern = lambda: "".join(gen_list(choose_lifted("a"), gen_length)())
+    def pattern():
+        return "".join(gen_list(choose_lifted("a"), gen_length)())
 
     def gen_flags():
         flags = 0
@@ -128,6 +132,7 @@ def gen_regexp(gen_length):
             flags = flags | re.VERBOSE
 
         return flags
+
     return lambda: re.compile(pattern(), gen_flags())
 
 
@@ -141,16 +146,17 @@ def gen_dbref():
 
 
 def gen_mongo_value(depth, ref):
-
-    choices = [gen_unicode(gen_range(0, 50)),
-               gen_printable_string(gen_range(0, 50)),
-               my_map(gen_string(gen_range(0, 1000)), bytes),
-               gen_int(),
-               gen_float(),
-               gen_boolean(),
-               gen_datetime(),
-               gen_objectid(),
-               lift(None)]
+    choices = [
+        gen_unicode(gen_range(0, 50)),
+        gen_printable_string(gen_range(0, 50)),
+        my_map(gen_string(gen_range(0, 1000)), bytes),
+        gen_int(),
+        gen_float(),
+        gen_boolean(),
+        gen_datetime(),
+        gen_objectid(),
+        lift(None),
+    ]
     if ref:
         choices.append(gen_dbref())
     if depth > 0:
@@ -164,9 +170,10 @@ def gen_mongo_list(depth, ref):
 
 
 def gen_mongo_dict(depth, ref=True):
-    return my_map(gen_dict(gen_unicode(gen_range(0, 20)),
-                        gen_mongo_value(depth - 1, ref),
-                        gen_range(0, 10)), SON)
+    return my_map(
+        gen_dict(gen_unicode(gen_range(0, 20)), gen_mongo_value(depth - 1, ref), gen_range(0, 10)),
+        SON,
+    )
 
 
 def simplify(case):  # TODO this is a hack
@@ -175,35 +182,35 @@ def simplify(case):  # TODO this is a hack
         if random.choice([True, False]):
             # delete
             simplified_keys = list(simplified)
-            if not len(simplified_keys):
+            if not simplified_keys:
                 return (False, case)
             simplified.pop(random.choice(simplified_keys))
             return (True, simplified)
         else:
             # simplify a value
             simplified_items = list(simplified.items())
-            if not len(simplified_items):
+            if not simplified_items:
                 return (False, case)
             (key, value) = random.choice(simplified_items)
             (success, value) = simplify(value)
             simplified[key] = value
-            return (success, success and simplified or case)
+            return (success, (success and simplified) or case)
     if isinstance(case, list):
         simplified = list(case)
         if random.choice([True, False]):
             # delete
-            if not len(simplified):
+            if not simplified:
                 return (False, case)
             simplified.pop(random.randrange(len(simplified)))
             return (True, simplified)
         else:
             # simplify an item
-            if not len(simplified):
+            if not simplified:
                 return (False, case)
             index = random.randrange(len(simplified))
             (success, value) = simplify(simplified[index])
             simplified[index] = value
-            return (success, success and simplified or case)
+            return (success, (success and simplified) or case)
     return (False, case)
 
 
@@ -216,7 +223,10 @@ def reduce(case, predicate, reductions=0):
 
 
 def isnt(predicate):
-    return lambda x: not predicate(x)
+    def is_not(x):
+        return not predicate(x)
+
+    return is_not
 
 
 def check(predicate, generator):
@@ -226,9 +236,9 @@ def check(predicate, generator):
         try:
             if not predicate(case):
                 reduction = reduce(case, predicate)
-                counter_examples.append("after %s reductions: %r" % reduction)
+                counter_examples.append("after {} reductions: {!r}".format(*reduction))
         except:
-            counter_examples.append("%r : %s" % (case, traceback.format_exc()))
+            counter_examples.append(f"{case!r} : {traceback.format_exc()}")
     return counter_examples
 
 
@@ -236,8 +246,10 @@ def check_unittest(test, predicate, generator):
     counter_examples = check(predicate, generator)
     if counter_examples:
         failures = len(counter_examples)
-        message = "\n".join(["    -> %s" % f for f in
-                             counter_examples[:examples]])
-        message = ("found %d counter examples, displaying first %d:\n%s" %
-                   (failures, min(failures, examples), message))
+        message = "\n".join(["    -> %s" % f for f in counter_examples[:examples]])
+        message = "found %d counter examples, displaying first %d:\n%s" % (
+            failures,
+            min(failures, examples),
+            message,
+        )
         test.fail(message)

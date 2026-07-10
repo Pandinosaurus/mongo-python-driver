@@ -11,34 +11,48 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from mockupdb import MockupDB
-from pymongo import MongoClient
-from pymongo.errors import ServerSelectionTimeoutError
+from __future__ import annotations
 
 import unittest
 
+import pytest
 
-class TestAuthRecoveringMember(unittest.TestCase):
+from test import PyMongoTestCase
+
+try:
+    from mockupdb import MockupDB
+
+    _HAVE_MOCKUPDB = True
+except ImportError:
+    _HAVE_MOCKUPDB = False
+
+from pymongo import common
+from pymongo.errors import ServerSelectionTimeoutError
+
+pytestmark = pytest.mark.mockupdb
+
+
+class TestAuthRecoveringMember(PyMongoTestCase):
     def test_auth_recovering_member(self):
         # Test that we don't attempt auth against a recovering RS member.
         server = MockupDB()
-        server.autoresponds('ismaster', {
-            'minWireVersion': 2,
-            'maxWireVersion': 6,
-            'ismaster': False,
-            'secondary': False,
-            'setName': 'rs'})
+        server.autoresponds(
+            "ismaster",
+            {
+                "minWireVersion": 2,
+                "maxWireVersion": common.MIN_SUPPORTED_WIRE_VERSION,
+                "ismaster": False,
+                "secondary": False,
+                "setName": "rs",
+            },
+        )
 
         server.run()
         self.addCleanup(server.stop)
 
-        client = MongoClient(server.uri,
-                             replicaSet='rs',
-                             serverSelectionTimeoutMS=100,
-                             socketTimeoutMS=100)
-
-        self.addCleanup(client.close)
+        client = self.simple_client(
+            server.uri, replicaSet="rs", serverSelectionTimeoutMS=100, socketTimeoutMS=100
+        )
 
         # Should see there's no primary or secondary and raise selection timeout
         # error. If it raises AutoReconnect we know it actually tried the
@@ -46,5 +60,6 @@ class TestAuthRecoveringMember(unittest.TestCase):
         with self.assertRaises(ServerSelectionTimeoutError):
             client.db.command("ping")
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

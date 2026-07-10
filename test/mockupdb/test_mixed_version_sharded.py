@@ -14,47 +14,58 @@
 
 """Test PyMongo with a mixed-version cluster."""
 
+from __future__ import annotations
+
 import time
+import unittest
+from queue import Queue
+
+import pytest
+
+from test import PyMongoTestCase
 
 try:
-    from queue import Queue
+    from mockupdb import MockupDB, go
+
+    _HAVE_MOCKUPDB = True
 except ImportError:
-    from Queue import Queue
+    _HAVE_MOCKUPDB = False
 
-from mockupdb import MockupDB, go, OpMsg
-from pymongo import MongoClient
+from operations import upgrades  # type: ignore[import]
 
-import unittest
-from operations import upgrades
+pytestmark = pytest.mark.mockupdb
 
 
-class TestMixedVersionSharded(unittest.TestCase):
+class TestMixedVersionSharded(PyMongoTestCase):
     def setup_server(self, upgrade):
         self.mongos_old, self.mongos_new = MockupDB(), MockupDB()
 
         # Collect queries to either server in one queue.
-        self.q = Queue()
+        self.q: Queue = Queue()
         for server in self.mongos_old, self.mongos_new:
             server.subscribe(self.q.put)
-            server.autoresponds('getlasterror')
+            server.autoresponds("getlasterror")
             server.run()
             self.addCleanup(server.stop)
 
         # Max wire version is too old for the upgraded operation.
-        self.mongos_old.autoresponds('ismaster', ismaster=True, msg='isdbgrid',
-                                     maxWireVersion=upgrade.wire_version - 1)
+        self.mongos_old.autoresponds(
+            "ismaster", ismaster=True, msg="isdbgrid", maxWireVersion=upgrade.wire_version - 1
+        )
 
         # Up-to-date max wire version.
-        self.mongos_new.autoresponds('ismaster', ismaster=True, msg='isdbgrid',
-                                     maxWireVersion=upgrade.wire_version)
+        self.mongos_new.autoresponds(
+            "ismaster", ismaster=True, msg="isdbgrid", maxWireVersion=upgrade.wire_version
+        )
 
-        self.mongoses_uri = 'mongodb://%s,%s' % (self.mongos_old.address_string,
-                                                 self.mongos_new.address_string)
+        self.mongoses_uri = (
+            f"mongodb://{self.mongos_old.address_string},{self.mongos_new.address_string}"
+        )
 
-        self.client = MongoClient(self.mongoses_uri)
+        self.client = self.simple_client(self.mongoses_uri)
 
     def tearDown(self):
-        if hasattr(self, 'client') and self.client:
+        if hasattr(self, "client") and self.client:
             self.client.close()
 
 
@@ -62,28 +73,29 @@ def create_mixed_version_sharded_test(upgrade):
     def test(self):
         self.setup_server(upgrade)
         start = time.time()
-        servers_used = set()
+        servers_used: set = set()
         while len(servers_used) < 2:
             go(upgrade.function, self.client)
             request = self.q.get(timeout=1)
             servers_used.add(request.server)
-            request.assert_matches(upgrade.old
-                                   if request.server is self.mongos_old
-                                   else upgrade.new)
+            request.assert_matches(
+                upgrade.old if request.server is self.mongos_old else upgrade.new
+            )
             if time.time() > start + 10:
-                self.fail('never used both mongoses')
+                self.fail("never used both mongoses")
+
     return test
 
 
 def generate_mixed_version_sharded_tests():
     for upgrade in upgrades:
         test = create_mixed_version_sharded_test(upgrade)
-        test_name = 'test_%s' % upgrade.name.replace(' ', '_')
+        test_name = "test_%s" % upgrade.name.replace(" ", "_")
         test.__name__ = test_name
         setattr(TestMixedVersionSharded, test_name, test)
 
 
 generate_mixed_version_sharded_tests()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()
